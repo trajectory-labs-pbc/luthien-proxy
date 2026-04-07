@@ -52,6 +52,10 @@ class _ConversationLinkState:
 class ConversationLinkPolicy(SimplePolicy):
     """Injects a conversation viewer link into the first response of each conversation."""
 
+    category = "simple_utilities"
+    display_name = "Conversation Link"
+    short_description = "Adds a link to the conversation viewer in the first response."
+
     def __init__(self, base_url: str = "http://localhost:8000", **kwargs: object) -> None:
         """Initialize with base URL for building viewer links."""
         self.config = ConversationLinkPolicyConfig(base_url=base_url)
