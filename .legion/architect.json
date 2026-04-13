@@ -1,0 +1,50 @@
+{
+  "scope": "large",
+  "components": [
+    "pipeline/openai_processor.py",
+    "pipeline/client_format.py",
+    "policy_core/openai_execution_interface.py",
+    "policy_core/openai_hook_policy.py",
+    "policy_core/multi_provider_hook_policy.py",
+    "llm/openai_client.py",
+    "llm/openai_client_cache.py",
+    "llm/types/openai.py",
+    "gateway_routes.py",
+    "credential_manager.py",
+    "config_fields.py",
+    "settings.py",
+    "policies/multi_serial_policy.py",
+    "history/routes.py",
+    "history/service.py",
+    "history/models.py"
+  ],
+  "subIssues": [
+    "LuthienResearch-luthien-proxy-563",
+    "LuthienResearch-luthien-proxy-564",
+    "LuthienResearch-luthien-proxy-565",
+    "LuthienResearch-luthien-proxy-566",
+    "LuthienResearch-luthien-proxy-567",
+    "LuthienResearch-luthien-proxy-568",
+    "LuthienResearch-luthien-proxy-569"
+  ],
+  "routingHints": {
+    "complexity": "large",
+    "estimatedImplementers": 3,
+    "skipRetro": false,
+    "implementationOrder": [
+      ["LuthienResearch-luthien-proxy-563", "LuthienResearch-luthien-proxy-564"],
+      ["LuthienResearch-luthien-proxy-565"],
+      ["LuthienResearch-luthien-proxy-566"],
+      ["LuthienResearch-luthien-proxy-567", "LuthienResearch-luthien-proxy-568", "LuthienResearch-luthien-proxy-569"]
+    ]
+  },
+  "concerns": [
+    "SSRF risk on x-openai-base-url header — mitigated by restricting to passthrough mode only (client_key mode ignores the header)",
+    "Upstream maintainers dropped OpenAI support in v3.0 — recommend probing with #563+#564 before full cascade",
+    "Credential validation via GET /v1/models may not work for all OpenAI-compatible providers — fallback: warn and allow",
+    "Usage telemetry normalization (#569) must happen at ingest in the pipeline processor, not in storage layer",
+    "Session detection asymmetry: Anthropic uses metadata.user_id body extraction; OpenAI uses x-session-id header only — this is intentional (OpenAI clients don't embed session IDs in request body)"
+  ],
+  "learningsInjected": [],
+  "learningsHelpful": []
+}

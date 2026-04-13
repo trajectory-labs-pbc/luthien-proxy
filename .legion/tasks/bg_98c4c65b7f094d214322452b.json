@@ -1,0 +1,10 @@
+{
+  "id": "bg_98c4c65b7f094d214322452b",
+  "status": "pending",
+  "agent": "momus",
+  "model": "anthropic/claude-sonnet-4-6",
+  "description": "Cross-family review of architect output",
+  "parentSessionID": "ses_f9eba11ba18f23GatS2oXRHa7g",
+  "createdAt": 1776055262418,
+  "sessionID": "ses_27adb6327ffeDAxsS1mv33HYz9"
+}
