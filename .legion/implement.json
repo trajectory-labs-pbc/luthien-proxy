@@ -1,0 +1,25 @@
+{
+  "filesChanged": [
+    "src/luthien_proxy/policies/string_replacement_policy.py",
+    "tests/luthien_proxy/unit_tests/policies/test_string_replacement_policy.py",
+    "changelog.d/557-string-replacement-request-filtering.md"
+  ],
+  "trickyParts": [
+    "Pyright TypedDict narrowing: block assignments in _apply_replacements_to_request_messages needed # type: ignore[typeddict-unknown-key] because Pyright can't narrow AnthropicContentBlock union via dict.get() checks. Used same pattern as existing on_anthropic_response code.",
+    "Replacement counting: counting occurrences before replacement (not after) to get accurate total_replacements count, since the replaced text may not contain the original pattern.",
+    "context.record_event vs add_span_event: initial implementation used add_span_event (OTEL-only) for request side; corrected to use context.record_event for both request and response so interventions appear in the dashboard activity monitor."
+  ],
+  "deviations": [
+    "Renamed response event from 'policy.anthropic_string_replacement.content_transformed' to 'policy.string_replacement.response_modified' for naming consistency with new request event. This is a minor breaking change for anyone monitoring that specific event name.",
+    "PR created to trajectory-labs-pbc/luthien-proxy (fork) rather than LuthienResearch/luthien-proxy (upstream) due to GitHub integration permissions. PR #3 at https://github.com/trajectory-labs-pbc/luthien-proxy/pull/3",
+    "apply_to uses 'request'/'response'/'both' enum (default 'response') rather than apply_to_requests/apply_to_responses booleans (default both True) as suggested in dispatch prompt. The enum approach follows the issue spec and is more explicit about intent."
+  ],
+  "openQuestions": [
+    "The response event rename ('policy.anthropic_string_replacement.content_transformed' -> 'policy.string_replacement.response_modified') may need a migration note if anyone is monitoring that event name in dashboards.",
+    "Streaming path (on_anthropic_stream_event) does not emit record_event per chunk — only the non-streaming on_anthropic_response path does. This is consistent with existing behavior but worth noting for completeness."
+  ],
+  "subPlanningNeeded": false,
+  "schemaVersion": 1,
+  "phase": "implement",
+  "completed": "2026-04-13T04:45:00.000Z"
+}
