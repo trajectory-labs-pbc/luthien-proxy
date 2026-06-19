@@ -117,8 +117,7 @@ def extract_preview(data: dict[str, Any] | str | None) -> str | None:
     older payloads recorded before ``original_request`` was stored. Accepts a
     dict (event payload) or a JSON string (asyncpg) or None. Returns None for
     probe requests (``max_tokens <= 1``) and when no usable user text is
-    present. A ``<system-reminder>`` block is stripped only when the message
-    STARTS with it (Claude Code's leading injection). The text is
+    present. ``<system-reminder>`` blocks are stripped before the text is
     whitespace-collapsed and, when longer than ``PREVIEW_MAX_LENGTH``, cut at
     that many characters with a literal ``"..."`` appended.
     """
@@ -152,9 +151,7 @@ def extract_preview(data: dict[str, Any] | str | None) -> str | None:
         content = _preview_text(msg.get("content"))
         if not content:
             continue
-        content = content.strip()
-        if content.startswith("<system-reminder>"):
-            content = _SYSTEM_REMINDER_RE.sub("", content).strip()
+        content = _SYSTEM_REMINDER_RE.sub("", content).strip()
         if not content:
             continue
         content = " ".join(content.split())

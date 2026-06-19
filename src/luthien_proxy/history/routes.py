@@ -26,7 +26,7 @@ from luthien_proxy.utils.constants import (
 from luthien_proxy.utils.db import DatabasePool
 
 from . import user_labels as user_labels_service
-from .models import SessionListResponse, SessionSearchParams
+from .models import SessionDetail, SessionListResponse, SessionSearchParams
 from .service import fetch_session_list, stream_session_detail_json, stream_session_jsonl, stream_session_markdown
 
 
@@ -197,7 +197,7 @@ async def delete_user_label(
     return {"deleted": True}
 
 
-@api_router.get("/sessions/{session_id}")
+@api_router.get("/sessions/{session_id}", responses={200: {"model": SessionDetail}})
 async def get_session(
     session_id: str,
     _: str = Depends(verify_admin_token),

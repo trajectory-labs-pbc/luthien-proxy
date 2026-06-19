@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import weakref
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -55,6 +54,8 @@ class CallEventRange:
 
 logger = logging.getLogger(__name__)
 _SUMMARY_BACKFILLED_POOLS: weakref.WeakSet[DatabasePool] = weakref.WeakSet()
+_SUMMARY_PREVIEWS_BACKFILLED_POOLS: weakref.WeakSet[DatabasePool] = weakref.WeakSet()
+_NO_PREVIEW_SENTINEL = ""
 
 # User-friendly descriptions for common policy event types.
 # Note: every current emitter writes a non-empty `summary` into the event
@@ -305,13 +306,6 @@ def _parse_response_messages(response: dict[str, Any]) -> list[ConversationMessa
     return messages
 
 
-# Maximum length for first user message preview
-_FIRST_MESSAGE_MAX_LENGTH = 100
-
-# Pattern to strip system-reminder tags from content
-_SYSTEM_REMINDER_PATTERN = re.compile(r"<system-reminder>.*?</system-reminder>\s*", re.DOTALL)
-
-
 def _extract_preview_message(payload: dict[str, Any] | str | None) -> str | None:
     """Extract the first meaningful user message from a request payload for preview.
 
@@ -321,51 +315,7 @@ def _extract_preview_message(payload: dict[str, Any] | str | None) -> str | None
     ``inject_policy_awareness_anthropic``). Falls back to ``final_request`` for
     older payloads recorded before ``original_request`` was stored.
     """
-    if not payload:
-        return None
-
-    # Handle JSON string (from asyncpg)
-    if isinstance(payload, str):
-        payload = _safe_parse_json(payload)
-        if not payload:
-            return None
-
-    request = payload.get("original_request") or payload.get("final_request") or {}
-
-    # Skip probe requests structurally: Claude Code sends internal probes
-    # (token counting, quota checks) with max_tokens=1. No real conversation
-    # uses max_tokens=1, so this catches all probes without a content blocklist.
-    max_tokens = request.get("max_tokens")
-    if max_tokens is not None:
-        try:
-            if int(max_tokens) <= 1:
-                return None
-        except (TypeError, ValueError) as e:
-            logger.debug(f"max_tokens conversion failed: {repr(e)}")
-
-    messages = request.get("messages", [])
-
-    # Find the first meaningful user message (captures session intent)
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") == "user":
-            content = extract_text_content(msg.get("content"))
-            if content:
-                # Truncate and clean up for display
-                content = content.strip()
-                # Skip system-reminder tags (Claude Code injects these)
-                if content.startswith("<system-reminder>"):
-                    content = _SYSTEM_REMINDER_PATTERN.sub("", content).strip()
-                if not content:
-                    continue
-                # Replace newlines with spaces for single-line preview
-                content = " ".join(content.split())
-                if len(content) > _FIRST_MESSAGE_MAX_LENGTH:
-                    content = content[:_FIRST_MESSAGE_MAX_LENGTH] + "..."
-                return content
-
-    return None
+    return extract_preview(payload)
 
 
 # A "real" policy intervention is any policy.* event that is not a judge
@@ -472,10 +422,20 @@ def _models_from_summary(value: object) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [model for model in value.split(",") if model]
+        return sorted(model for model in value.split(",") if model)
     if isinstance(value, list | tuple):
-        return [str(model) for model in value if model]
+        return sorted(str(model) for model in value if model)
     return []
+
+
+def _preview_from_summary(value: object) -> str | None:
+    if value is None or value == _NO_PREVIEW_SENTINEL:
+        return None
+    return str(value)
+
+
+def _last_timestamp_from_ranges(ranges: Sequence[CallEventRange]) -> datetime:
+    return max(call_range.last_ts for call_range in ranges)
 
 
 def _row_value(row: Any, primary: str, fallback: str) -> object:
@@ -564,6 +524,8 @@ async def _backfill_missing_session_summaries(db_pool: DatabasePool) -> None:
 async def _backfill_session_summary_previews(db_pool: DatabasePool) -> None:
     if not isinstance(db_pool, DatabasePool):
         return
+    if db_pool in _SUMMARY_PREVIEWS_BACKFILLED_POOLS:
+        return
     batch_size = 500
     cursor = ""
     async with db_pool.connection() as conn:
@@ -580,6 +542,7 @@ async def _backfill_session_summary_previews(db_pool: DatabasePool) -> None:
                 batch_size,
             )
             if not session_rows:
+                _SUMMARY_PREVIEWS_BACKFILLED_POOLS.add(db_pool)
                 return
             for session_row in session_rows:
                 session_id = str(session_row["session_id"])
@@ -613,19 +576,17 @@ async def _backfill_session_summary_previews(db_pool: DatabasePool) -> None:
                         """,
                         session_id,
                     )
-                if payload_row is None:
-                    continue
-                raw_payload = payload_row["payload"]
-                payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
-                if not isinstance(payload, dict):
-                    continue
-                preview = extract_preview(payload)
-                if preview is not None:
-                    await conn.execute(
-                        "UPDATE session_summaries SET preview_message = $1 WHERE session_id = $2",
-                        preview,
-                        session_id,
-                    )
+                preview: str | None = None
+                if payload_row is not None:
+                    raw_payload = payload_row["payload"]
+                    payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                    if isinstance(payload, dict):
+                        preview = extract_preview(payload)
+                await conn.execute(
+                    "UPDATE session_summaries SET preview_message = $1 WHERE session_id = $2",
+                    preview if preview is not None else _NO_PREVIEW_SENTINEL,
+                    session_id,
+                )
 
 
 async def fetch_session_list(
@@ -729,11 +690,7 @@ async def _fetch_session_list_pg(
                     total_events=_int_value(row["total_events"]),
                     policy_interventions=_int_value(row["policy_interventions"]),
                     models_used=_models_from_summary(_row_value(row, "models_used", "models")),
-                    preview_message=(
-                        str(row["preview_message"])
-                        if "preview_message" in row and row["preview_message"] is not None
-                        else _extract_preview_message(cast(_PreviewPayload, row["request_payload"]))
-                    ),
+                    preview_message=_preview_from_summary(row["preview_message"]),
                     user_ids=user_ids_by_session.get(str(row["session_id"]), []),
                 )
                 for row in rows
@@ -914,7 +871,7 @@ async def _fetch_session_list_pg(
             turn_count=int(row["turn_count"]),  # type: ignore[arg-type]
             total_events=int(row["total_events"]),  # type: ignore[arg-type]
             policy_interventions=int(row["policy_interventions"]),  # type: ignore[arg-type]
-            models_used=list(row["models"]) if row["models"] else [],  # type: ignore[arg-type]
+            models_used=_models_from_summary(row["models"]),
             preview_message=_extract_preview_message(cast(_PreviewPayload, row["request_payload"])),
             user_ids=user_ids_by_session.get(str(row["session_id"]), []),
         )
@@ -1001,7 +958,7 @@ async def _fetch_session_list_sqlite(
                     total_events=_int_value(row["total_events"]),
                     policy_interventions=_int_value(row["policy_interventions"]),
                     models_used=_models_from_summary(_row_value(row, "models_used", "models")),
-                    preview_message=str(row["preview_message"]) if row["preview_message"] is not None else None,
+                    preview_message=_preview_from_summary(row["preview_message"]),
                     user_ids=user_ids_by_session.get(str(row["session_id"]), []),
                 )
                 for row in rows
@@ -1205,7 +1162,7 @@ async def _fetch_session_list_sqlite(
             turn_count=int(row["turn_count"]),  # type: ignore[arg-type]
             total_events=int(row["total_events"]),  # type: ignore[arg-type]
             policy_interventions=int(row["policy_interventions"]),  # type: ignore[arg-type]
-            models_used=models_by_session.get(str(row["session_id"]), []),
+            models_used=sorted(models_by_session.get(str(row["session_id"]), [])),
             preview_message=preview_by_session.get(str(row["session_id"])),
             user_ids=user_ids_by_session.get(str(row["session_id"]), []),
         )
@@ -1346,6 +1303,8 @@ async def iter_session_turns(
     """Yield full conversation turns one call at a time."""
     if ranges is None:
         ranges = await _fetch_call_ranges(session_id, db_pool)
+    # The call-id range list is a phase-1 snapshot. Per-call fetches may see later
+    # writes, but keeping the bounded range set preserves streaming memory usage.
     async with db_pool.connection() as conn:
         async with conn.transaction():
             for call_range in ranges:
@@ -1353,11 +1312,12 @@ async def iter_session_turns(
                     """
                     SELECT call_id, event_type, payload, created_at
                     FROM conversation_events
-                    WHERE session_id = $1 AND call_id = $2
+                    WHERE session_id = $1 AND call_id = $2 AND created_at <= $3
                     ORDER BY created_at ASC
                     """,
                     session_id,
                     call_range.call_id,
+                    call_range.last_ts,
                 )
                 yield _build_turn(call_range.call_id, _stored_events_from_rows(list(rows)))
 
@@ -1379,9 +1339,11 @@ async def _streaming_detail_stats(
 async def stream_session_detail_json(session_id: str, db_pool: DatabasePool) -> AsyncIterator[bytes]:
     """Stream the session detail JSON response without materializing all turns."""
     ranges = await _fetch_call_ranges(session_id, db_pool)
+    # Detail/JSONL may truncate after a committed 200 if a per-call read fails;
+    # markdown computes header stats before yielding, so the same failure is pre-response.
     yield b'{"session_id":"' + json.dumps(session_id).encode()[1:-1] + b'",'
     yield b'"first_timestamp":"' + ranges[0].first_ts.isoformat().encode() + b'",'
-    yield b'"last_timestamp":"' + ranges[-1].last_ts.isoformat().encode() + b'",'
+    yield b'"last_timestamp":"' + _last_timestamp_from_ranges(ranges).isoformat().encode() + b'",'
     yield b'"turns":['
     total_interventions = 0
     models: set[str] = set()
@@ -1405,7 +1367,7 @@ async def stream_session_markdown(session_id: str, db_pool: DatabasePool) -> Asy
     yield f"# Conversation History: {session_id}\n"
     yield "\n"
     yield f"**Started:** {ranges[0].first_ts.isoformat()}\n"
-    yield f"**Ended:** {ranges[-1].last_ts.isoformat()}\n"
+    yield f"**Ended:** {_last_timestamp_from_ranges(ranges).isoformat()}\n"
     yield f"**Turns:** {len(ranges)}\n"
     if models:
         yield f"**Models:** {', '.join(models)}\n"

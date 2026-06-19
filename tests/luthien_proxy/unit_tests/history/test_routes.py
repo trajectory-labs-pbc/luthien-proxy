@@ -10,7 +10,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 
 from luthien_proxy.history.models import (
     ConversationMessage,
@@ -22,6 +22,7 @@ from luthien_proxy.history.models import (
     SessionSummary,
 )
 from luthien_proxy.history.routes import (
+    api_router,
     export_session,
     get_session,
     list_sessions,
@@ -220,6 +221,15 @@ class TestListSessionsRoute:
 
 class TestGetSessionRoute:
     """Test get_session route handler."""
+
+    def test_openapi_documents_session_detail_schema(self):
+        """Session detail streaming route keeps its documented response schema."""
+        app = FastAPI()
+        app.include_router(api_router)
+
+        schema = app.openapi()["paths"]["/api/history/sessions/{session_id}"]["get"]["responses"]["200"]
+
+        assert schema["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/SessionDetail"}
 
     @pytest.mark.asyncio
     async def test_successful_get_session(self):
