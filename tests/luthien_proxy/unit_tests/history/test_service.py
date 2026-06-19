@@ -17,8 +17,10 @@ from luthien_proxy.history.models import (
     MessageType,
     PolicyAnnotation,
     SessionDetail,
+    SessionSearchParams,
 )
 from luthien_proxy.history.service import (
+    StoredEvent,
     _build_turn,
     _extract_preview_message,
     _extract_tool_calls,
@@ -32,6 +34,77 @@ from luthien_proxy.history.service import (
     fetch_session_detail,
     fetch_session_list,
 )
+
+
+async def _collect_bytes(chunks) -> bytes:
+    parts: list[bytes] = []
+    async for chunk in chunks:
+        if isinstance(chunk, str):
+            parts.append(chunk.encode())
+        else:
+            parts.append(chunk)
+    return b"".join(parts)
+
+
+def _enable_mock_transaction(mock_conn: AsyncMock) -> None:
+    mock_conn.transaction = MagicMock()
+    mock_conn.transaction.return_value.__aenter__ = AsyncMock(return_value=None)
+    mock_conn.transaction.return_value.__aexit__ = AsyncMock(return_value=None)
+
+
+def _equivalence_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "call_id": "call-1",
+            "event_type": "transaction.request_recorded",
+            "payload": {
+                "final_model": "gpt-4",
+                "original_request": {"messages": [{"role": "user", "content": "Hi"}]},
+                "final_request": {"messages": [{"role": "user", "content": "Hi"}]},
+            },
+            "created_at": datetime(2025, 1, 15, 10, 0, 0),
+        },
+        {
+            "call_id": "call-1",
+            "event_type": "transaction.streaming_response_recorded",
+            "payload": {
+                "original_response": {"choices": [{"message": {"content": "Hello!"}}]},
+                "final_response": {"choices": [{"message": {"content": "Hello!"}}]},
+            },
+            "created_at": datetime(2025, 1, 15, 10, 0, 1),
+        },
+        {
+            "call_id": "call-2",
+            "event_type": "transaction.request_recorded",
+            "payload": {
+                "final_model": "claude-3-sonnet",
+                "original_request": {"messages": [{"role": "user", "content": "Hi"}]},
+                "final_request": {
+                    "messages": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "Hello!"},
+                        {"role": "user", "content": "Use the tool"},
+                    ]
+                },
+            },
+            "created_at": datetime(2025, 1, 15, 10, 2, 0),
+        },
+        {
+            "call_id": "call-2",
+            "event_type": "policy.anthropic_judge.tool_call_blocked",
+            "payload": {"summary": "Dangerous operation blocked", "rule": "deny"},
+            "created_at": datetime(2025, 1, 15, 10, 2, 1),
+        },
+        {
+            "call_id": "call-2",
+            "event_type": "transaction.non_streaming_response_recorded",
+            "payload": {
+                "original_response": {"choices": [{"message": {"content": "Done"}}]},
+                "final_response": {"choices": [{"message": {"content": "Blocked"}}]},
+            },
+            "created_at": datetime(2025, 1, 15, 10, 2, 2),
+        },
+    ]
 
 
 class TestGetEventSummary:
@@ -119,6 +192,7 @@ class TestExtractPreviewMessage:
         long_message = "x" * 150
         payload = {"final_request": {"messages": [{"role": "user", "content": long_message}]}}
         result = _extract_preview_message(payload)
+        assert result is not None
         assert len(result) == 103  # 100 chars + "..."
         assert result.endswith("...")
 
@@ -775,7 +849,7 @@ class TestBuildTurn:
 
     def test_simple_turn(self):
         """Test building a simple request/response turn."""
-        events = [
+        events: list[StoredEvent] = [
             {
                 "event_type": "transaction.request_recorded",
                 "payload": {
@@ -805,7 +879,7 @@ class TestBuildTurn:
 
     def test_request_params_allowlist(self):
         """Test that request_params only includes allowlisted fields."""
-        events = [
+        events: list[StoredEvent] = [
             {
                 "event_type": "transaction.request_recorded",
                 "payload": {
@@ -848,7 +922,7 @@ class TestBuildTurn:
 
     def test_turn_with_policy_intervention(self):
         """Test turn with policy modification."""
-        events = [
+        events: list[StoredEvent] = [
             {
                 "event_type": "transaction.request_recorded",
                 "payload": {
@@ -876,7 +950,7 @@ class TestBuildTurn:
 
     def test_missing_final_request_raises_error(self):
         """Test that missing final_request raises KeyError."""
-        events = [
+        events: list[StoredEvent] = [
             {
                 "event_type": "transaction.request_recorded",
                 "payload": {
@@ -893,7 +967,7 @@ class TestBuildTurn:
 
     def test_missing_final_response_raises_error(self):
         """Test that missing final_response raises KeyError."""
-        events = [
+        events: list[StoredEvent] = [
             {
                 "event_type": "transaction.request_recorded",
                 "payload": {
@@ -918,7 +992,7 @@ class TestBuildTurn:
 
     def test_anthropic_turn_with_text_response(self):
         """Test building a turn from Anthropic-format request and response events."""
-        events = [
+        events: list[StoredEvent] = [
             {
                 "event_type": "transaction.request_recorded",
                 "payload": {
@@ -1062,6 +1136,53 @@ class TestFetchSessionList:
         assert result.has_more is False
         assert result.sessions == []
 
+    @pytest.mark.asyncio
+    async def test_unfiltered_pg_list_uses_session_summaries_without_payload(self):
+        """Unfiltered list hot path reads session_summaries and never selects full payloads."""
+        summary_rows = [
+            {
+                "session_id": "session-1",
+                "first_ts": datetime(2025, 1, 15, 10, 0, 0),
+                "last_ts": datetime(2025, 1, 15, 11, 0, 0),
+                "total_events": 10,
+                "turn_count": 3,
+                "policy_interventions": 1,
+                "models_used": "gpt-4,claude-3",
+                "preview_message": "Hello world",
+            },
+        ]
+        mock_conn = AsyncMock()
+        mock_conn.fetchval.return_value = 1
+        mock_conn.fetch.side_effect = [summary_rows, []]
+        mock_pool = MagicMock()
+        mock_pool.is_sqlite = False
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        result = await fetch_session_list(limit=10, db_pool=mock_pool)
+
+        queries = [call.args[0].lower() for call in mock_conn.fetch.call_args_list]
+        assert result.sessions[0].preview_message == "Hello world"
+        assert result.sessions[0].models_used == ["gpt-4", "claude-3"]
+        assert "from session_summaries" in queries[0]
+        assert "payload" not in queries[0]
+        assert "request_payload" not in queries[0]
+
+    @pytest.mark.asyncio
+    async def test_pg_search_path_still_uses_existing_aggregation(self):
+        """Full-text search remains on conversation_events aggregation."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchval.return_value = 0
+        mock_conn.fetch.return_value = []
+        mock_pool = MagicMock()
+        mock_pool.is_sqlite = False
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        await fetch_session_list(limit=10, db_pool=mock_pool, search=SessionSearchParams(model="gpt-4"))
+
+        query = mock_conn.fetch.call_args.args[0].lower()
+        assert "from conversation_events" in query
+        assert "request_payload" in query
+
 
 class TestFetchSessionDetail:
     """Test fetching session detail from database."""
@@ -1177,6 +1298,83 @@ class TestFetchSessionDetail:
 
         with pytest.raises(TypeError, match="got int"):
             await fetch_session_detail("session-1", mock_pool)
+
+    @pytest.mark.asyncio
+    async def test_streamed_session_detail_json_matches_existing_fetch_output(self):
+        """Streaming detail JSON is semantically identical to existing SessionDetail."""
+        from luthien_proxy.history import service
+
+        rows = _equivalence_rows()
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+        mock_conn.fetch.side_effect = [
+            rows,
+            [
+                {"call_id": "call-1", "first_ts": rows[0]["created_at"], "last_ts": rows[1]["created_at"]},
+                {"call_id": "call-2", "first_ts": rows[2]["created_at"], "last_ts": rows[4]["created_at"]},
+            ],
+            rows[:2],
+            rows[2:],
+        ]
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+        expected = await fetch_session_detail("session-1", mock_pool)
+
+        body = await _collect_bytes(service.stream_session_detail_json("session-1", mock_pool))
+
+        assert json.loads(body) == expected.model_dump(mode="json")
+
+    @pytest.mark.asyncio
+    async def test_streamed_detail_payload_fetches_are_scoped_to_one_call(self):
+        """Streaming detail enumerates call ids without payload and fetches payloads per call."""
+        from luthien_proxy.history import service
+
+        rows = _equivalence_rows()
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+        mock_conn.fetch.side_effect = [
+            [
+                {"call_id": "call-1", "first_ts": rows[0]["created_at"], "last_ts": rows[1]["created_at"]},
+                {"call_id": "call-2", "first_ts": rows[2]["created_at"], "last_ts": rows[4]["created_at"]},
+            ],
+            rows[:2],
+            rows[2:],
+        ]
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        await _collect_bytes(service.stream_session_detail_json("session-1", mock_pool))
+
+        queries = [call.args[0].lower() for call in mock_conn.fetch.call_args_list]
+        assert "payload" not in queries[0]
+        payload_queries = [query for query in queries[1:] if "payload" in query]
+        assert len(payload_queries) == 2
+        for call in mock_conn.fetch.call_args_list[1:]:
+            assert call.args[1] == "session-1"
+            assert call.args[2] in {"call-1", "call-2"}
+
+    @pytest.mark.asyncio
+    async def test_streamed_exports_match_existing_export_output(self):
+        """Streaming markdown and JSONL exports equal existing exporters."""
+        from luthien_proxy.history import service
+
+        rows = _equivalence_rows()
+        metadata = [
+            {"call_id": "call-1", "first_ts": rows[0]["created_at"], "last_ts": rows[1]["created_at"]},
+            {"call_id": "call-2", "first_ts": rows[2]["created_at"], "last_ts": rows[4]["created_at"]},
+        ]
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+        mock_conn.fetch.side_effect = [rows, metadata, rows[:2], rows[2:], rows[:2], rows[2:], metadata, rows[:2], rows[2:]]
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+        expected = await fetch_session_detail("session-1", mock_pool)
+
+        markdown = (await _collect_bytes(service.stream_session_markdown("session-1", mock_pool))).decode()
+        jsonl = (await _collect_bytes(service.stream_session_jsonl("session-1", mock_pool))).decode()
+
+        assert markdown == export_session_markdown(expected)
+        assert jsonl == export_session_jsonl(expected)
 
 
 class TestExportSessionMarkdown:

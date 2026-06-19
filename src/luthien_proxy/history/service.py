@@ -11,9 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import weakref
+from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, TypedDict, cast
 
+from luthien_proxy.observability.session_summary import extract_preview
 from luthien_proxy.utils.db import DatabasePool, parse_db_ts
 from luthien_proxy.utils.search import session_fts_filter_sql
 
@@ -40,7 +44,17 @@ class StoredEvent(TypedDict):
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class CallEventRange:
+    """Chronological call id and timestamp bounds for payload-scoped streaming."""
+
+    call_id: str
+    first_ts: datetime
+    last_ts: datetime
+
+
 logger = logging.getLogger(__name__)
+_SUMMARY_BACKFILLED_POOLS: weakref.WeakSet[DatabasePool] = weakref.WeakSet()
 
 # User-friendly descriptions for common policy event types.
 # Note: every current emitter writes a non-empty `summary` into the event
@@ -454,6 +468,166 @@ def _having_clause(having: list[str]) -> str:
     return ("HAVING " + " AND ".join(having)) if having else ""
 
 
+def _models_from_summary(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [model for model in value.split(",") if model]
+    if isinstance(value, list | tuple):
+        return [str(model) for model in value if model]
+    return []
+
+
+def _row_value(row: Any, primary: str, fallback: str) -> object:
+    try:
+        return row[primary]
+    except KeyError:
+        return row[fallback]
+
+
+def _int_value(value: object) -> int:
+    if isinstance(value, int | str | float):
+        return int(value)
+    raise TypeError(f"Expected numeric row value, got {type(value).__name__}")
+
+
+async def _backfill_missing_session_summaries(db_pool: DatabasePool) -> None:
+    if not isinstance(db_pool, DatabasePool):
+        return
+    if db_pool in _SUMMARY_BACKFILLED_POOLS:
+        return
+    async with db_pool.connection() as conn:
+        if db_pool.is_postgres:
+            await conn.execute(
+                f"""
+                INSERT INTO session_summaries (
+                    session_id, first_seen, last_seen, event_count, call_count,
+                    policy_event_count, user_id, models_used
+                )
+                SELECT
+                    ce.session_id,
+                    MIN(ce.created_at),
+                    MAX(ce.created_at),
+                    COUNT(*),
+                    COUNT(*) FILTER (WHERE ce.event_type = 'transaction.request_recorded'),
+                    {_intervention_count_expr(True)},
+                    (SELECT cc.user_id FROM conversation_calls cc
+                       WHERE cc.session_id = ce.session_id AND cc.user_id IS NOT NULL
+                       ORDER BY cc.created_at LIMIT 1),
+                    (SELECT string_agg(DISTINCT ce2.payload->>'final_model', ',')
+                       FROM conversation_events ce2
+                       WHERE ce2.session_id = ce.session_id
+                         AND ce2.event_type = 'transaction.request_recorded'
+                         AND ce2.payload->>'final_model' IS NOT NULL)
+                FROM conversation_events ce
+                WHERE ce.session_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM session_summaries ss WHERE ss.session_id = ce.session_id
+                )
+                GROUP BY ce.session_id
+                ON CONFLICT (session_id) DO NOTHING
+                """
+            )
+        else:
+            await conn.execute(
+                f"""
+                INSERT OR IGNORE INTO session_summaries (
+                    session_id, first_seen, last_seen, event_count, call_count,
+                    policy_event_count, user_id, models_used
+                )
+                SELECT
+                    ce.session_id,
+                    MIN(ce.created_at),
+                    MAX(ce.created_at),
+                    COUNT(*),
+                    SUM(CASE WHEN ce.event_type = 'transaction.request_recorded' THEN 1 ELSE 0 END),
+                    {_intervention_count_expr(False)},
+                    (SELECT cc.user_id FROM conversation_calls cc
+                       WHERE cc.session_id = ce.session_id AND cc.user_id IS NOT NULL
+                       ORDER BY cc.created_at LIMIT 1),
+                    (SELECT GROUP_CONCAT(DISTINCT json_extract(ce2.payload, '$.final_model'))
+                       FROM conversation_events ce2
+                       WHERE ce2.session_id = ce.session_id
+                         AND ce2.event_type = 'transaction.request_recorded'
+                         AND json_extract(ce2.payload, '$.final_model') IS NOT NULL)
+                FROM conversation_events ce
+                WHERE ce.session_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM session_summaries ss WHERE ss.session_id = ce.session_id
+                )
+                GROUP BY ce.session_id
+                """
+            )
+    _SUMMARY_BACKFILLED_POOLS.add(db_pool)
+
+
+async def _backfill_session_summary_previews(db_pool: DatabasePool) -> None:
+    if not isinstance(db_pool, DatabasePool):
+        return
+    batch_size = 500
+    cursor = ""
+    async with db_pool.connection() as conn:
+        while True:
+            session_rows = await conn.fetch(
+                """
+                SELECT session_id
+                FROM session_summaries
+                WHERE preview_message IS NULL AND session_id > $1
+                ORDER BY session_id
+                LIMIT $2
+                """,
+                cursor,
+                batch_size,
+            )
+            if not session_rows:
+                return
+            for session_row in session_rows:
+                session_id = str(session_row["session_id"])
+                cursor = session_id
+                if db_pool.is_postgres:
+                    payload_row = await conn.fetchrow(
+                        """
+                        SELECT payload
+                        FROM conversation_events
+                        WHERE session_id = $1
+                        AND event_type = 'transaction.request_recorded'
+                        AND COALESCE((payload->'final_request'->>'max_tokens')::int, 2) > 1
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        """,
+                        session_id,
+                    )
+                else:
+                    payload_row = await conn.fetchrow(
+                        """
+                        SELECT payload
+                        FROM conversation_events
+                        WHERE session_id = $1
+                        AND event_type = 'transaction.request_recorded'
+                        AND COALESCE(
+                            CAST(json_extract(payload, '$.final_request.max_tokens') AS INTEGER),
+                            2
+                        ) > 1
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        """,
+                        session_id,
+                    )
+                if payload_row is None:
+                    continue
+                raw_payload = payload_row["payload"]
+                payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                if not isinstance(payload, dict):
+                    continue
+                preview = extract_preview(payload)
+                if preview is not None:
+                    await conn.execute(
+                        "UPDATE session_summaries SET preview_message = $1 WHERE session_id = $2",
+                        preview,
+                        session_id,
+                    )
+
+
 async def fetch_session_list(
     limit: int,
     db_pool: DatabasePool,
@@ -502,7 +676,76 @@ async def _fetch_session_list_pg(
     # touch conversation_calls in the hot CTE — user_ids come from a separate
     # post-query keyed on the page's session_ids (mirrors the SQLite pattern).
     search = search or SessionSearchParams()
+    if search.is_empty() and user_id is None:
+        await _backfill_missing_session_summaries(db_pool)
+        await _backfill_session_summary_previews(db_pool)
     async with db_pool.connection() as conn:
+        if search.is_empty() and user_id is None:
+            total_count = await conn.fetchval("SELECT COUNT(*) FROM session_summaries")
+            rows = await conn.fetch(
+                """
+                SELECT
+                    session_id,
+                    first_seen as first_ts,
+                    last_seen as last_ts,
+                    event_count as total_events,
+                    call_count as turn_count,
+                    policy_event_count as policy_interventions,
+                    models_used,
+                    preview_message
+                FROM session_summaries
+                ORDER BY last_seen DESC
+                LIMIT $1 OFFSET $2
+                """,
+                limit,
+                offset,
+            )
+            user_ids_by_session: dict[str, list[str]] = {}
+            if rows:
+                session_ids_on_page = [str(row["session_id"]) for row in rows]
+                placeholders = ", ".join(f"${i + 1}" for i in range(len(session_ids_on_page)))
+                user_id_rows = await conn.fetch(
+                    f"""
+                    SELECT DISTINCT ce.session_id, cc.user_id
+                    FROM conversation_events ce
+                    JOIN conversation_calls cc ON ce.call_id = cc.call_id
+                    WHERE ce.session_id IN ({placeholders})
+                    AND cc.user_id IS NOT NULL
+                    """,
+                    *session_ids_on_page,
+                )
+                for r in user_id_rows:
+                    sid = str(r["session_id"])
+                    uid = str(r["user_id"])
+                    bucket = user_ids_by_session.setdefault(sid, [])
+                    if uid not in bucket:
+                        bucket.append(uid)
+            sessions = [
+                SessionSummary(
+                    session_id=str(row["session_id"]),
+                    first_timestamp=parse_db_ts(row["first_ts"]).isoformat(),
+                    last_timestamp=parse_db_ts(row["last_ts"]).isoformat(),
+                    turn_count=_int_value(row["turn_count"]),
+                    total_events=_int_value(row["total_events"]),
+                    policy_interventions=_int_value(row["policy_interventions"]),
+                    models_used=_models_from_summary(_row_value(row, "models_used", "models")),
+                    preview_message=(
+                        str(row["preview_message"])
+                        if "preview_message" in row and row["preview_message"] is not None
+                        else _extract_preview_message(cast(_PreviewPayload, row["request_payload"]))
+                    ),
+                    user_ids=user_ids_by_session.get(str(row["session_id"]), []),
+                )
+                for row in rows
+            ]
+            total = _int_value(total_count) if total_count is not None else 0
+            return SessionListResponse(
+                sessions=sessions,
+                total=total,
+                offset=offset,
+                has_more=offset + len(sessions) < total,
+            )
+
         if search.is_empty():
             if user_id is not None:
                 total_count = await conn.fetchval(
@@ -702,7 +945,74 @@ async def _fetch_session_list_sqlite(
     # parameters, never interpolated into the SQL string. user_id occupies $3
     # in the page query ($1 in the filtered count); search params follow.
     search = search or SessionSearchParams()
+    if search.is_empty() and user_id is None:
+        await _backfill_missing_session_summaries(db_pool)
+        await _backfill_session_summary_previews(db_pool)
     async with db_pool.connection() as conn:
+        if search.is_empty() and user_id is None:
+            total_count = await conn.fetchval("SELECT COUNT(*) FROM session_summaries")
+            rows = await conn.fetch(
+                """
+                SELECT
+                    session_id,
+                    first_seen as first_ts,
+                    last_seen as last_ts,
+                    event_count as total_events,
+                    call_count as turn_count,
+                    policy_event_count as policy_interventions,
+                    models_used,
+                    preview_message
+                FROM session_summaries
+                ORDER BY last_seen DESC
+                LIMIT $1 OFFSET $2
+                """,
+                limit,
+                offset,
+            )
+            total = _int_value(total_count) if total_count is not None else 0
+            if not rows:
+                return SessionListResponse(sessions=[], total=total, offset=offset, has_more=False)
+
+            session_ids = [str(row["session_id"]) for row in rows]
+            placeholders = ", ".join(f"${i + 1}" for i in range(len(session_ids)))
+            user_id_rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT ce.session_id, cc.user_id
+                FROM conversation_events ce
+                JOIN conversation_calls cc ON ce.call_id = cc.call_id
+                WHERE ce.session_id IN ({placeholders})
+                AND cc.user_id IS NOT NULL
+                """,
+                *session_ids,
+            )
+            user_ids_by_session: dict[str, list[str]] = {}
+            for r in user_id_rows:
+                sid = str(r["session_id"])
+                uid = str(r["user_id"])
+                bucket = user_ids_by_session.setdefault(sid, [])
+                if uid not in bucket:
+                    bucket.append(uid)
+            sessions = [
+                SessionSummary(
+                    session_id=str(row["session_id"]),
+                    first_timestamp=parse_db_ts(row["first_ts"]).isoformat(),
+                    last_timestamp=parse_db_ts(row["last_ts"]).isoformat(),
+                    turn_count=_int_value(row["turn_count"]),
+                    total_events=_int_value(row["total_events"]),
+                    policy_interventions=_int_value(row["policy_interventions"]),
+                    models_used=_models_from_summary(_row_value(row, "models_used", "models")),
+                    preview_message=str(row["preview_message"]) if row["preview_message"] is not None else None,
+                    user_ids=user_ids_by_session.get(str(row["session_id"]), []),
+                )
+                for row in rows
+            ]
+            return SessionListResponse(
+                sessions=sessions,
+                total=total,
+                offset=offset,
+                has_more=offset + len(sessions) < total,
+            )
+
         if search.is_empty():
             if user_id is not None:
                 total_count = await conn.fetchval(
@@ -986,6 +1296,169 @@ async def fetch_session_detail(session_id: str, db_pool: DatabasePool) -> Sessio
     )
 
 
+def _stored_events_from_rows(rows: Sequence[Mapping[str, object]]) -> list[StoredEvent]:
+    events: list[StoredEvent] = []
+    for row in rows:
+        raw_payload = row["payload"]
+        if isinstance(raw_payload, dict):
+            payload: dict[str, Any] = dict(raw_payload)
+        elif isinstance(raw_payload, str):
+            payload = json.loads(raw_payload)
+        else:
+            raise TypeError(f"Unexpected payload type: {type(raw_payload).__name__}")
+        events.append(
+            StoredEvent(
+                event_type=str(row["event_type"]),
+                payload=payload,
+                created_at=parse_db_ts(row["created_at"]),
+            )
+        )
+    return events
+
+
+async def _fetch_call_ranges(session_id: str, db_pool: DatabasePool) -> list[CallEventRange]:
+    async with db_pool.connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT call_id, MIN(created_at) as first_ts, MAX(created_at) as last_ts
+            FROM conversation_events
+            WHERE session_id = $1
+            GROUP BY call_id
+            ORDER BY MIN(created_at) ASC
+            """,
+            session_id,
+        )
+    if not rows:
+        raise ValueError(f"No events found for session_id: {session_id}")
+    return [
+        CallEventRange(
+            call_id=str(row["call_id"]),
+            first_ts=parse_db_ts(row["first_ts"]),
+            last_ts=parse_db_ts(row["last_ts"]),
+        )
+        for row in rows
+    ]
+
+
+async def iter_session_turns(
+    session_id: str, db_pool: DatabasePool, ranges: list[CallEventRange] | None = None
+) -> AsyncIterator[ConversationTurn]:
+    """Yield full conversation turns one call at a time."""
+    if ranges is None:
+        ranges = await _fetch_call_ranges(session_id, db_pool)
+    async with db_pool.connection() as conn:
+        async with conn.transaction():
+            for call_range in ranges:
+                rows = await conn.fetch(
+                    """
+                    SELECT call_id, event_type, payload, created_at
+                    FROM conversation_events
+                    WHERE session_id = $1 AND call_id = $2
+                    ORDER BY created_at ASC
+                    """,
+                    session_id,
+                    call_range.call_id,
+                )
+                yield _build_turn(call_range.call_id, _stored_events_from_rows(list(rows)))
+
+
+async def _streaming_detail_stats(
+    session_id: str, db_pool: DatabasePool
+) -> tuple[list[CallEventRange], int, list[str]]:
+    ranges = await _fetch_call_ranges(session_id, db_pool)
+    total_interventions = 0
+    models: set[str] = set()
+    async for turn in iter_session_turns(session_id, db_pool, ranges):
+        if turn.model:
+            models.add(turn.model)
+        if turn.had_policy_intervention:
+            total_interventions += len(turn.annotations)
+    return ranges, total_interventions, sorted(models)
+
+
+async def stream_session_detail_json(session_id: str, db_pool: DatabasePool) -> AsyncIterator[bytes]:
+    """Stream the session detail JSON response without materializing all turns."""
+    ranges = await _fetch_call_ranges(session_id, db_pool)
+    yield b'{"session_id":"' + json.dumps(session_id).encode()[1:-1] + b'",'
+    yield b'"first_timestamp":"' + ranges[0].first_ts.isoformat().encode() + b'",'
+    yield b'"last_timestamp":"' + ranges[-1].last_ts.isoformat().encode() + b'",'
+    yield b'"turns":['
+    total_interventions = 0
+    models: set[str] = set()
+    first_turn = True
+    async for turn in iter_session_turns(session_id, db_pool, ranges):
+        if not first_turn:
+            yield b","
+        first_turn = False
+        yield turn.model_dump_json().encode()
+        if turn.model:
+            models.add(turn.model)
+        if turn.had_policy_intervention:
+            total_interventions += len(turn.annotations)
+    yield b'],"total_policy_interventions":' + str(total_interventions).encode() + b","
+    yield b'"models_used":' + json.dumps(sorted(models)).encode() + b"}"
+
+
+async def stream_session_markdown(session_id: str, db_pool: DatabasePool) -> AsyncIterator[str]:
+    """Stream the markdown export without materializing all turns."""
+    ranges, total_interventions, models = await _streaming_detail_stats(session_id, db_pool)
+    yield f"# Conversation History: {session_id}\n"
+    yield "\n"
+    yield f"**Started:** {ranges[0].first_ts.isoformat()}\n"
+    yield f"**Ended:** {ranges[-1].last_ts.isoformat()}\n"
+    yield f"**Turns:** {len(ranges)}\n"
+    if models:
+        yield f"**Models:** {', '.join(models)}\n"
+    if total_interventions > 0:
+        yield f"**Policy Interventions:** {total_interventions}\n"
+    yield "\n---\n"
+    yield "\n"
+    turn_number = 1
+    async for turn in iter_session_turns(session_id, db_pool, ranges):
+        yield f"## Turn {turn_number}\n"
+        if turn.model:
+            yield f"*Model: {turn.model}*\n"
+        yield "\n"
+        for msg in turn.request_messages:
+            yield _format_message_markdown(msg)
+            yield "\n\n"
+        for msg in turn.response_messages:
+            yield _format_message_markdown(msg)
+            yield "\n\n"
+        if turn.annotations:
+            yield "### Policy Annotations\n"
+            for ann in turn.annotations:
+                yield f"- **{ann.policy_name}**: {ann.summary}\n"
+            yield "\n"
+        yield "---\n"
+        if turn_number < len(ranges):
+            yield "\n"
+        turn_number += 1
+
+
+async def stream_session_jsonl(session_id: str, db_pool: DatabasePool) -> AsyncIterator[str]:
+    """Stream the JSONL export without materializing all turns."""
+    ranges = await _fetch_call_ranges(session_id, db_pool)
+    async for turn in iter_session_turns(session_id, db_pool, ranges):
+        record: dict[str, object] = {
+            "call_id": turn.call_id,
+            "session_id": session_id,
+            "timestamp": turn.timestamp,
+            "model": turn.model,
+            "request_messages": [m.model_dump(mode="json") for m in turn.request_messages],
+            "response_messages": [m.model_dump(mode="json") for m in turn.response_messages],
+            "annotations": [a.model_dump(mode="json") for a in turn.annotations],
+            "had_policy_intervention": turn.had_policy_intervention,
+            "request_was_modified": turn.request_was_modified,
+            "response_was_modified": turn.response_was_modified,
+        }
+        if turn.original_request_messages is not None:
+            record["original_request_messages"] = [m.model_dump(mode="json") for m in turn.original_request_messages]
+        if turn.original_response_messages is not None:
+            record["original_response_messages"] = [m.model_dump(mode="json") for m in turn.original_response_messages]
+        yield json.dumps(record, default=str) + "\n"
+
+
 _REQUEST_PARAM_ALLOWLIST = frozenset(
     {
         "model",
@@ -1229,6 +1702,10 @@ __all__ = [
     "extract_text_content",
     "fetch_session_list",
     "fetch_session_detail",
+    "iter_session_turns",
     "export_session_markdown",
     "export_session_jsonl",
+    "stream_session_detail_json",
+    "stream_session_markdown",
+    "stream_session_jsonl",
 ]
