@@ -36,6 +36,7 @@ function conversationViewer() {
         loadedOffset: 0,
         loadedEnd: 0,
         loadingOlder: false,
+        initialLoadComplete: false,
 
         init() {
             const pathParts = window.location.pathname.split('/');
@@ -106,7 +107,7 @@ function conversationViewer() {
             });
 
             window.addEventListener('scroll', () => {
-                if (window.scrollY < 80) {
+                if (this.initialLoadComplete && window.scrollY < 80) {
                     this.loadOlderTurns();
                 }
             });
@@ -142,7 +143,10 @@ function conversationViewer() {
                 this.updateStats(data);
                 this.updateTimestamp();
                 this.renderTurns();
-                this.$nextTick(() => this.autoScrollToBottom());
+                this.$nextTick(() => {
+                    this.autoScrollToBottom();
+                    this.initialLoadComplete = true;
+                });
             } catch (err) {
                 this.showError(`Failed to load: ${err.message}`);
             }
