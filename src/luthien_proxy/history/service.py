@@ -52,10 +52,18 @@ class CallEventRange:
     last_ts: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class RequestDeltaState:
+    """Running message-count state for server-side transcript delta emission."""
+
+    prev_real_msg_count: int = 0
+
+
 logger = logging.getLogger(__name__)
 _SUMMARY_BACKFILLED_POOLS: weakref.WeakSet[DatabasePool] = weakref.WeakSet()
 _SUMMARY_PREVIEWS_BACKFILLED_POOLS: weakref.WeakSet[DatabasePool] = weakref.WeakSet()
 _NO_PREVIEW_SENTINEL = ""
+_SESSION_DETAIL_BATCH_SIZE = 25
 
 # User-friendly descriptions for common policy event types.
 # Note: every current emitter writes a non-empty `summary` into the event
@@ -1226,14 +1234,16 @@ async def fetch_session_detail(session_id: str, db_pool: DatabasePool) -> Sessio
         )
 
     # Build conversation turns, sorted by first event timestamp
-    turns = []
+    turns: list[ConversationTurn] = []
     all_models = set()
     total_interventions = 0
+    delta_state = RequestDeltaState()
 
     # Sort call_ids by their first event timestamp to ensure chronological order
     sorted_call_ids = sorted(calls.keys(), key=lambda cid: calls[cid][0]["created_at"])
     for call_id in sorted_call_ids:
-        turn = _build_turn(call_id, calls[call_id])
+        full_turn = _build_turn(call_id, calls[call_id])
+        turn, delta_state = _apply_request_delta(full_turn, delta_state)
         turns.append(turn)
         if turn.model:
             all_models.add(turn.model)
@@ -1273,6 +1283,94 @@ def _stored_events_from_rows(rows: Sequence[Mapping[str, object]]) -> list[Store
     return events
 
 
+def _is_preflight_turn(turn: ConversationTurn) -> bool:
+    params = turn.request_params or {}
+    max_tokens = params.get("max_tokens")
+    if max_tokens == 1:
+        return True
+    output_config = params.get("output_config")
+    if not isinstance(output_config, dict):
+        return False
+    output_format = output_config.get("format")
+    if not isinstance(output_format, dict):
+        return False
+    if output_format.get("type") != "json_schema":
+        return False
+    return isinstance(max_tokens, int) and max_tokens <= 256
+
+
+def _apply_request_delta(
+    turn: ConversationTurn, state: RequestDeltaState
+) -> tuple[ConversationTurn, RequestDeltaState]:
+    full_request_messages = turn.request_messages
+    request_messages_full = full_request_messages if turn.request_was_modified else None
+    if _is_preflight_turn(turn):
+        return (
+            turn.model_copy(
+                update={
+                    "request_messages": full_request_messages,
+                    "request_messages_full": request_messages_full,
+                }
+            ),
+            state,
+        )
+
+    request_delta = full_request_messages[state.prev_real_msg_count :]
+    return (
+        turn.model_copy(
+            update={
+                "request_messages": request_delta,
+                "request_messages_full": request_messages_full,
+            }
+        ),
+        RequestDeltaState(prev_real_msg_count=len(full_request_messages)),
+    )
+
+
+def _range_batches(ranges: Sequence[CallEventRange]) -> list[Sequence[CallEventRange]]:
+    return [
+        ranges[index : index + _SESSION_DETAIL_BATCH_SIZE]
+        for index in range(0, len(ranges), _SESSION_DETAIL_BATCH_SIZE)
+    ]
+
+
+async def _fetch_turn_batch_rows(
+    conn: Any, session_id: str, batch: Sequence[CallEventRange], *, is_sqlite: bool
+) -> dict[str, list[Mapping[str, object]]]:
+    if is_sqlite:
+        placeholders = ", ".join(f"${index}" for index in range(2, len(batch) + 2))
+        rows = await conn.fetch(
+            f"""
+            SELECT call_id, event_type, payload, created_at
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id IN ({placeholders})
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            *(call_range.call_id for call_range in batch),
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT call_id, event_type, payload, created_at
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id = ANY($2)
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            [call_range.call_id for call_range in batch],
+        )
+
+    range_by_call_id = {call_range.call_id: call_range for call_range in batch}
+    grouped: dict[str, list[Mapping[str, object]]] = {call_range.call_id: [] for call_range in batch}
+    for row in rows:
+        call_id = str(row["call_id"])
+        call_range = range_by_call_id.get(call_id)
+        if call_range is not None and parse_db_ts(row["created_at"]) <= call_range.last_ts:
+            grouped[call_id].append(row)
+    return grouped
+
+
 async def _fetch_call_ranges(session_id: str, db_pool: DatabasePool) -> list[CallEventRange]:
     async with db_pool.connection() as conn:
         rows = await conn.fetch(
@@ -1300,26 +1398,26 @@ async def _fetch_call_ranges(session_id: str, db_pool: DatabasePool) -> list[Cal
 async def iter_session_turns(
     session_id: str, db_pool: DatabasePool, ranges: list[CallEventRange] | None = None
 ) -> AsyncIterator[ConversationTurn]:
-    """Yield full conversation turns one call at a time."""
+    """Yield conversation turns with request messages reduced to transcript deltas."""
     if ranges is None:
         ranges = await _fetch_call_ranges(session_id, db_pool)
-    # The call-id range list is a phase-1 snapshot. Per-call fetches may see later
-    # writes, but keeping the bounded range set preserves streaming memory usage.
+    delta_state = RequestDeltaState()
     async with db_pool.connection() as conn:
         async with conn.transaction():
-            for call_range in ranges:
-                rows = await conn.fetch(
-                    """
-                    SELECT call_id, event_type, payload, created_at
-                    FROM conversation_events
-                    WHERE session_id = $1 AND call_id = $2 AND created_at <= $3
-                    ORDER BY created_at ASC
-                    """,
+            for batch in _range_batches(ranges):
+                rows_by_call_id = await _fetch_turn_batch_rows(
+                    conn,
                     session_id,
-                    call_range.call_id,
-                    call_range.last_ts,
+                    batch,
+                    is_sqlite=db_pool.is_sqlite is True,
                 )
-                yield _build_turn(call_range.call_id, _stored_events_from_rows(list(rows)))
+                for call_range in batch:
+                    full_turn = _build_turn(
+                        call_range.call_id,
+                        _stored_events_from_rows(rows_by_call_id[call_range.call_id]),
+                    )
+                    turn, delta_state = _apply_request_delta(full_turn, delta_state)
+                    yield turn
 
 
 async def _streaming_detail_stats(
@@ -1416,6 +1514,8 @@ async def stream_session_jsonl(session_id: str, db_pool: DatabasePool) -> AsyncI
         }
         if turn.original_request_messages is not None:
             record["original_request_messages"] = [m.model_dump(mode="json") for m in turn.original_request_messages]
+        if turn.request_messages_full is not None:
+            record["request_messages_full"] = [m.model_dump(mode="json") for m in turn.request_messages_full]
         if turn.original_response_messages is not None:
             record["original_response_messages"] = [m.model_dump(mode="json") for m in turn.original_response_messages]
         yield json.dumps(record, default=str) + "\n"
@@ -1527,6 +1627,7 @@ def _build_turn(call_id: str, events: list[StoredEvent]) -> ConversationTurn:
         timestamp=timestamp,
         model=model,
         request_messages=request_messages,
+        request_messages_full=request_messages if request_was_modified else None,
         response_messages=response_messages,
         annotations=annotations,
         had_policy_intervention=had_intervention,
@@ -1623,6 +1724,8 @@ def export_session_jsonl(session: SessionDetail) -> str:
         }
         if turn.original_request_messages is not None:
             record["original_request_messages"] = [m.model_dump(mode="json") for m in turn.original_request_messages]
+        if turn.request_messages_full is not None:
+            record["request_messages_full"] = [m.model_dump(mode="json") for m in turn.request_messages_full]
         if turn.original_response_messages is not None:
             record["original_response_messages"] = [m.model_dump(mode="json") for m in turn.original_response_messages]
         lines.append(json.dumps(record, default=str))

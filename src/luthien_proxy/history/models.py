@@ -53,6 +53,7 @@ class ConversationTurn(BaseModel):
     model: str | None = None
     # Messages in this turn (from final request/response)
     request_messages: list[ConversationMessage]
+    request_messages_full: list[ConversationMessage] | None = None
     response_messages: list[ConversationMessage]
     # Policy annotations for this turn
     annotations: list[PolicyAnnotation]
