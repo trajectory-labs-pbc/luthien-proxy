@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -41,6 +41,7 @@ from luthien_proxy.history.service import (
     fetch_session_detail,
     fetch_session_list,
     iter_session_turns,
+    stream_session_detail_json,
 )
 from luthien_proxy.utils.db import DatabasePool, parse_db_ts
 from luthien_proxy.utils.db_sqlite import SqliteConnection
@@ -181,6 +182,40 @@ def _response_event(content: str, created_at: datetime) -> StoredEvent:
     )
 
 
+def _window_rows(call_count: int) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    messages: list[dict[str, object]] = []
+    base_time = datetime(2025, 1, 15, 10, 0, 0)
+    for index in range(call_count):
+        call_id = f"window-call-{index + 1}"
+        messages = [*messages, {"role": "user", "content": f"message {index + 1}"}]
+        request_time = base_time + timedelta(minutes=index)
+        rows.append(
+            {
+                "call_id": call_id,
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_model": DEFAULT_TEST_MODEL,
+                    "final_request": {
+                        "model": DEFAULT_TEST_MODEL,
+                        "messages": messages,
+                        "stream": True,
+                    },
+                },
+                "created_at": request_time,
+            }
+        )
+        rows.append(
+            {
+                "call_id": call_id,
+                "event_type": "transaction.non_streaming_response_recorded",
+                "payload": {"final_response": {"choices": [{"message": {"content": f"response {index + 1}"}}]}},
+                "created_at": request_time + timedelta(seconds=1),
+            }
+        )
+    return rows
+
+
 def _range_rows_from_event_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     grouped: dict[str, list[dict[str, object]]] = {}
     for row in rows:
@@ -248,13 +283,115 @@ def _message_rows_from_event_rows(rows: list[dict[str, object]], call_ids: list[
     return output
 
 
+def _summary_row_from_event_rows(rows: list[dict[str, object]]) -> dict[str, object] | None:
+    if not rows:
+        return None
+    return {
+        "first_ts": min(parse_db_ts(row["created_at"]) for row in rows),
+        "last_ts": max(parse_db_ts(row["created_at"]) for row in rows),
+        "total_turns": len(
+            {str(row["call_id"]) for row in rows if row["event_type"] == "transaction.request_recorded"}
+        ),
+    }
+
+
+def _session_stats_row_from_event_rows(rows: list[dict[str, object]]) -> dict[str, object]:
+    models: set[str] = set()
+    policy_interventions = 0
+    for row in rows:
+        event_type = str(row["event_type"])
+        if event_type.startswith("policy.") and "judge.evaluation" not in event_type:
+            policy_interventions += 1
+        if event_type != "transaction.request_recorded":
+            continue
+        payload = row["payload"]
+        if not isinstance(payload, dict):
+            continue
+        model = payload.get("final_model")
+        if model is not None:
+            models.add(str(model))
+    return {"policy_interventions": policy_interventions, "models_used": ",".join(sorted(models))}
+
+
+def _request_window_rows_from_event_rows(
+    rows: list[dict[str, object]], limit: int, offset: int
+) -> list[dict[str, object]]:
+    request_rows = [row for row in rows if row["event_type"] == "transaction.request_recorded"]
+    return [
+        {"call_id": row["call_id"], "request_ts": row["created_at"]}
+        for row in sorted(request_rows, key=lambda row: parse_db_ts(row["created_at"]))[offset : offset + limit]
+    ]
+
+
+def _previous_raw_msg_count_from_event_rows(
+    rows: list[dict[str, object]], before_ts: object
+) -> dict[str, object] | None:
+    previous_rows = []
+    for row in rows:
+        if row["event_type"] != "transaction.request_recorded":
+            continue
+        payload = row["payload"]
+        if not isinstance(payload, dict):
+            continue
+        final_request = payload.get("final_request")
+        if not isinstance(final_request, dict):
+            continue
+        max_tokens = final_request.get("max_tokens")
+        output_config = final_request.get("output_config")
+        output_format = output_config.get("format") if isinstance(output_config, dict) else None
+        if max_tokens == 1 or (
+            isinstance(output_format, dict) and output_format.get("type") == "json_schema" and max_tokens <= 256
+        ):
+            continue
+        if parse_db_ts(row["created_at"]) < parse_db_ts(before_ts):
+            previous_rows.append(row)
+    if not previous_rows:
+        return None
+    previous_row = max(previous_rows, key=lambda row: parse_db_ts(row["created_at"]))
+    payload = previous_row["payload"]
+    if not isinstance(payload, dict):
+        return None
+    final_request = payload.get("final_request")
+    if not isinstance(final_request, dict):
+        return None
+    messages = final_request.get("messages")
+    if not isinstance(messages, list):
+        return {"raw_msg_count": 0}
+    return {"raw_msg_count": len(messages)}
+
+
+def _fetchrow_from_event_rows(rows: list[dict[str, object]]):
+    def fetch_row(query: str, _session_id: str, *args: object):
+        lowered = query.lower()
+        if "from session_summaries" in lowered:
+            return None
+        if "count(distinct case" in lowered:
+            return _summary_row_from_event_rows(rows)
+        if "policy_interventions" in lowered and "models_used" in lowered:
+            return _session_stats_row_from_event_rows(rows)
+        if "raw_msg_count" in lowered:
+            return _previous_raw_msg_count_from_event_rows(rows, args[0])
+        return None
+
+    return fetch_row
+
+
 def _fetch_from_event_rows(rows: list[dict[str, object]]):
     def fetch_rows(query: str, _session_id: str, *args: object):
         lowered = query.lower()
+        if "raw_msg_count" in lowered:
+            projection_rows = _projection_rows_from_event_rows(rows)
+            if len(args) == 2 and all(isinstance(arg, int) for arg in args):
+                limit = int(args[0])
+                offset = int(args[1])
+                return sorted(projection_rows, key=lambda row: parse_db_ts(row["request_ts"]))[offset : offset + limit]
+            return projection_rows
+        if "created_at as request_ts" in lowered:
+            limit = int(args[0])
+            offset = int(args[1])
+            return _request_window_rows_from_event_rows(rows, limit, offset)
         if "group by call_id" in lowered:
             return _range_rows_from_event_rows(rows)
-        if "raw_msg_count" in lowered:
-            return _projection_rows_from_event_rows(rows)
         call_ids = args[0] if len(args) == 1 and isinstance(args[0], list) else list(args)
         if " as messages" in lowered:
             return _message_rows_from_event_rows(rows, [str(call_id) for call_id in call_ids])
@@ -267,6 +404,11 @@ def _fetch_from_event_rows(rows: list[dict[str, object]]):
         return [row for row in rows if row["call_id"] in call_ids]
 
     return fetch_rows
+
+
+def _stub_event_rows(mock_conn: AsyncMock, rows: list[dict[str, object]]) -> None:
+    mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+    mock_conn.fetchrow.side_effect = _fetchrow_from_event_rows(rows)
 
 
 def _assert_turns_field_equal(actual: list[ConversationTurn], expected: list[ConversationTurn]) -> None:
@@ -397,6 +539,28 @@ async def _insert_sqlite_call(conn: SqliteConnection, call_id: str, session_id: 
         session_id,
         created_at,
     )
+
+
+async def _insert_sqlite_event_rows(conn: SqliteConnection, session_id: str, rows: list[dict[str, object]]) -> None:
+    inserted_call_ids: set[str] = set()
+    for index, row in enumerate(rows):
+        call_id = str(row["call_id"])
+        created_at = parse_db_ts(row["created_at"]).isoformat()
+        if call_id not in inserted_call_ids:
+            await _insert_sqlite_call(conn, call_id, session_id, created_at)
+            inserted_call_ids.add(call_id)
+        await conn.execute(
+            """
+            INSERT INTO conversation_events (id, call_id, event_type, payload, session_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            f"{session_id}-{index}-{row['call_id']}-{row['event_type']}",
+            row["call_id"],
+            row["event_type"],
+            json.dumps(row["payload"]),
+            session_id,
+            created_at,
+        )
 
 
 class TestReadFinalOnceFastPath:
@@ -962,6 +1126,400 @@ class TestReadFinalOnceFastPath:
             slow_turn.request_params,
             sort_keys=True,
         )
+
+    @pytest.mark.asyncio
+    async def test_windowed_detail_defaults_to_newest_page_with_metadata(self, sqlite_pool: DatabasePool):
+        rows = _window_rows(6)
+        async with sqlite_pool.connection() as conn:
+            inserted_call_ids: set[str] = set()
+            for row in rows:
+                call_id = str(row["call_id"])
+                if call_id not in inserted_call_ids:
+                    await _insert_sqlite_call(
+                        conn,
+                        call_id,
+                        "session-window-default",
+                        parse_db_ts(row["created_at"]).isoformat(),
+                    )
+                    inserted_call_ids.add(call_id)
+                await conn.execute(
+                    """
+                    INSERT INTO conversation_events (id, call_id, event_type, payload, session_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    f"default-{row['call_id']}-{row['event_type']}",
+                    row["call_id"],
+                    row["event_type"],
+                    json.dumps(row["payload"]),
+                    "session-window-default",
+                    parse_db_ts(row["created_at"]).isoformat(),
+                )
+
+        detail = await fetch_session_detail("session-window-default", sqlite_pool, offset=None, limit=2)
+
+        assert detail.total_turns == 6
+        assert detail.offset == 4
+        assert detail.limit == 2
+        assert detail.has_more is True
+        assert [turn.call_id for turn in detail.turns] == ["window-call-5", "window-call-6"]
+        assert [turn.request_messages[0].content for turn in detail.turns] == ["message 5", "message 6"]
+
+    @pytest.mark.asyncio
+    async def test_windowed_turns_match_full_slice_for_sqlite_middle_window(self, sqlite_pool: DatabasePool):
+        rows = _window_rows(5)
+        async with sqlite_pool.connection() as conn:
+            inserted_call_ids: set[str] = set()
+            for row in rows:
+                call_id = str(row["call_id"])
+                if call_id not in inserted_call_ids:
+                    await _insert_sqlite_call(
+                        conn,
+                        call_id,
+                        "session-window-slice",
+                        parse_db_ts(row["created_at"]).isoformat(),
+                    )
+                    inserted_call_ids.add(call_id)
+                await conn.execute(
+                    """
+                    INSERT INTO conversation_events (id, call_id, event_type, payload, session_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    f"slice-{row['call_id']}-{row['event_type']}",
+                    row["call_id"],
+                    row["event_type"],
+                    json.dumps(row["payload"]),
+                    "session-window-slice",
+                    parse_db_ts(row["created_at"]).isoformat(),
+                )
+
+        full_ranges = await service._fetch_call_ranges("session-window-slice", sqlite_pool)
+        full_turns = [turn async for turn in iter_session_turns("session-window-slice", sqlite_pool, full_ranges)]
+        window = await fetch_session_detail("session-window-slice", sqlite_pool, offset=2, limit=2)
+
+        assert [turn.model_dump_json() for turn in window.turns] == [turn.model_dump_json() for turn in full_turns[2:4]]
+        assert window.offset == 2
+        assert window.limit == 2
+        assert window.has_more is True
+        assert window.total_turns == 5
+
+    @pytest.mark.asyncio
+    async def test_windowed_projection_query_limits_before_json_projection(self):
+        rows = _window_rows(3)
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+        _stub_event_rows(mock_conn, rows)
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        await fetch_session_detail("session-bounded-query", mock_pool, offset=1, limit=1)
+
+        projection_query = next(
+            call.args[0].lower() for call in mock_conn.fetch.call_args_list if "raw_msg_count" in call.args[0].lower()
+        )
+        source_index = projection_query.index("from \n                (")
+        limit_index = projection_query.index("limit $2 offset $3")
+        projection_index = projection_query.index("order by call_id, created_at asc")
+        assert source_index < limit_index < projection_index
+
+    @pytest.mark.asyncio
+    async def test_windowed_detail_stats_match_list_and_stay_invariant_for_sqlite(self, sqlite_pool: DatabasePool):
+        rows = _window_rows(6)
+        for index, row in enumerate(rows):
+            if row["event_type"] != "transaction.request_recorded":
+                continue
+            payload = row["payload"]
+            assert isinstance(payload, dict)
+            final_request = payload["final_request"]
+            assert isinstance(final_request, dict)
+            model = "claude-opus-4-6" if index % 4 == 0 else "gpt-4"
+            payload["final_model"] = model
+            final_request["model"] = model
+        rows.extend(
+            [
+                {
+                    "call_id": "window-call-2",
+                    "event_type": "policy.string_replacement.request_modified",
+                    "payload": {"summary": "request changed"},
+                    "created_at": datetime(2025, 1, 15, 10, 1, 30),
+                },
+                {
+                    "call_id": "window-call-5",
+                    "event_type": "policy.judge.tool_call_blocked",
+                    "payload": {"summary": "tool blocked"},
+                    "created_at": datetime(2025, 1, 15, 10, 4, 30),
+                },
+                {
+                    "call_id": "window-call-6",
+                    "event_type": "policy.anthropic_judge.evaluation_complete",
+                    "payload": {"summary": "judge bookkeeping"},
+                    "created_at": datetime(2025, 1, 15, 10, 5, 30),
+                },
+            ]
+        )
+        async with sqlite_pool.connection() as conn:
+            await _insert_sqlite_event_rows(conn, "session-window-stats", rows)
+
+        summary = (await fetch_session_list(limit=10, db_pool=sqlite_pool)).sessions[0]
+        first_page = await fetch_session_detail("session-window-stats", sqlite_pool, offset=0, limit=2)
+        middle_page = await fetch_session_detail("session-window-stats", sqlite_pool, offset=2, limit=2)
+        last_page = await fetch_session_detail("session-window-stats", sqlite_pool, offset=4, limit=2)
+        streamed_last_page = json.loads(
+            (
+                await _collect_bytes(stream_session_detail_json("session-window-stats", sqlite_pool, offset=4, limit=2))
+            ).decode()
+        )
+
+        assert summary.policy_interventions == 2
+        assert summary.models_used == ["claude-opus-4-6", "gpt-4"]
+        for detail in [first_page, middle_page, last_page]:
+            assert detail.total_policy_interventions == summary.policy_interventions
+            assert detail.models_used == summary.models_used
+        assert streamed_last_page["total_policy_interventions"] == summary.policy_interventions
+        assert streamed_last_page["models_used"] == summary.models_used
+
+    @pytest.mark.asyncio
+    async def test_windowed_detail_stats_stay_invariant_for_pg_queries(self):
+        rows = _window_rows(5)
+        for index, row in enumerate(rows):
+            if row["event_type"] != "transaction.request_recorded":
+                continue
+            payload = row["payload"]
+            assert isinstance(payload, dict)
+            final_request = payload["final_request"]
+            assert isinstance(final_request, dict)
+            model = "claude-3-opus" if index == 0 else "gpt-4"
+            payload["final_model"] = model
+            final_request["model"] = model
+        rows.append(
+            {
+                "call_id": "window-call-1",
+                "event_type": "policy.string_replacement.response_modified",
+                "payload": {"summary": "response changed"},
+                "created_at": datetime(2025, 1, 15, 10, 0, 30),
+            }
+        )
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+        _stub_event_rows(mock_conn, rows)
+        mock_pool = MagicMock()
+        mock_pool.is_sqlite = False
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        first_page = await fetch_session_detail("session-pg-window-stats", mock_pool, offset=0, limit=2)
+        last_page = await fetch_session_detail("session-pg-window-stats", mock_pool, offset=3, limit=2)
+
+        assert first_page.total_policy_interventions == 1
+        assert last_page.total_policy_interventions == 1
+        assert first_page.models_used == ["claude-3-opus", "gpt-4"]
+        assert last_page.models_used == ["claude-3-opus", "gpt-4"]
+
+    @pytest.mark.asyncio
+    async def test_windowed_detail_large_request_payload_parses_are_bounded_by_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        original_json_list = service._json_list
+
+        async def large_parse_count(turn_count: int) -> int:
+            parse_count = 0
+
+            def counting_json_list(value):
+                nonlocal parse_count
+                if isinstance(value, list) and len(value) > 20:
+                    parse_count += 1
+                return original_json_list(value)
+
+            monkeypatch.setattr(service, "_json_list", counting_json_list)
+            rows = _window_rows(turn_count)
+            mock_conn = AsyncMock()
+            _enable_mock_transaction(mock_conn)
+            _stub_event_rows(mock_conn, rows)
+            mock_pool = MagicMock()
+            mock_pool.is_sqlite = False
+            mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+            await fetch_session_detail("session-bounded-parse", mock_pool, offset=100, limit=10)
+            return parse_count
+
+        assert await large_parse_count(200) == 1
+        assert await large_parse_count(400) == 1
+
+    @pytest.mark.asyncio
+    async def test_windowed_detail_preserves_modified_request_slow_fallback(self, sqlite_pool: DatabasePool):
+        rows = _window_rows(3)
+        modified_payload = rows[2]["payload"]
+        assert isinstance(modified_payload, dict)
+        final_request = modified_payload["final_request"]
+        assert isinstance(final_request, dict)
+        modified_payload["original_request"] = {"messages": [{"role": "user", "content": "original"}]}
+        final_request["messages"] = [*final_request["messages"], {"role": "user", "content": "modified"}]
+        async with sqlite_pool.connection() as conn:
+            inserted_call_ids: set[str] = set()
+            for row in rows:
+                call_id = str(row["call_id"])
+                if call_id not in inserted_call_ids:
+                    await _insert_sqlite_call(
+                        conn,
+                        call_id,
+                        "session-window-modified",
+                        parse_db_ts(row["created_at"]).isoformat(),
+                    )
+                    inserted_call_ids.add(call_id)
+                await conn.execute(
+                    """
+                    INSERT INTO conversation_events (id, call_id, event_type, payload, session_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    f"modified-{row['call_id']}-{row['event_type']}",
+                    row["call_id"],
+                    row["event_type"],
+                    json.dumps(row["payload"]),
+                    "session-window-modified",
+                    parse_db_ts(row["created_at"]).isoformat(),
+                )
+
+        window = await fetch_session_detail("session-window-modified", sqlite_pool, offset=1, limit=1)
+
+        assert len(window.turns) == 1
+        assert window.turns[0].request_was_modified is True
+        assert window.turns[0].request_messages_full is not None
+        assert window.turns[0].original_request_messages is not None
+
+    @pytest.mark.asyncio
+    async def test_stream_session_detail_json_matches_fetch_window(self, sqlite_pool: DatabasePool):
+        rows = _window_rows(4)
+        async with sqlite_pool.connection() as conn:
+            inserted_call_ids: set[str] = set()
+            for row in rows:
+                call_id = str(row["call_id"])
+                if call_id not in inserted_call_ids:
+                    await _insert_sqlite_call(
+                        conn,
+                        call_id,
+                        "session-window-stream",
+                        parse_db_ts(row["created_at"]).isoformat(),
+                    )
+                    inserted_call_ids.add(call_id)
+                await conn.execute(
+                    """
+                    INSERT INTO conversation_events (id, call_id, event_type, payload, session_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    f"stream-{row['call_id']}-{row['event_type']}",
+                    row["call_id"],
+                    row["event_type"],
+                    json.dumps(row["payload"]),
+                    "session-window-stream",
+                    parse_db_ts(row["created_at"]).isoformat(),
+                )
+
+        fetched = await fetch_session_detail("session-window-stream", sqlite_pool, offset=1, limit=2)
+        streamed = json.loads(
+            (
+                await _collect_bytes(
+                    stream_session_detail_json("session-window-stream", sqlite_pool, offset=1, limit=2)
+                )
+            ).decode()
+        )
+
+        assert streamed == fetched.model_dump(mode="json")
+
+    @pytest.mark.asyncio
+    async def test_window_boundary_ignores_prior_preflight_raw_message_count(self):
+        rows = [
+            {
+                "call_id": "call-1",
+                "event_type": "transaction.request_recorded",
+                "payload": {"final_request": {"messages": [{"role": "user", "content": "first"}]}},
+                "created_at": datetime(2025, 1, 15, 10, 0, 0),
+            },
+            {
+                "call_id": "preflight",
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_request": {
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": f"probe {index}"} for index in range(10)],
+                    }
+                },
+                "created_at": datetime(2025, 1, 15, 10, 1, 0),
+            },
+            {
+                "call_id": "call-2",
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_request": {
+                        "messages": [
+                            {"role": "user", "content": "first"},
+                            {"role": "assistant", "content": "ack"},
+                            {"role": "user", "content": "second"},
+                        ]
+                    }
+                },
+                "created_at": datetime(2025, 1, 15, 10, 2, 0),
+            },
+        ]
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+        _stub_event_rows(mock_conn, rows)
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        detail = await fetch_session_detail("session-preflight-boundary", mock_pool, offset=2, limit=1)
+
+        assert [message.content for message in detail.turns[0].request_messages] == ["ack", "second"]
+
+    @pytest.mark.asyncio
+    async def test_exports_remain_full_session_when_detail_default_is_windowed(self):
+        rows = _window_rows(60)
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+        _stub_event_rows(mock_conn, rows)
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        detail_body = json.loads(await _collect_bytes(stream_session_detail_json("session-export-full", mock_pool)))
+        jsonl = (await _collect_bytes(service.stream_session_jsonl("session-export-full", mock_pool))).decode()
+        markdown = (await _collect_bytes(service.stream_session_markdown("session-export-full", mock_pool))).decode()
+
+        assert len(detail_body["turns"]) == 50
+        assert len(jsonl.strip().splitlines()) == 60
+        assert "**Turns:** 60" in markdown
+
+    @pytest.mark.asyncio
+    async def test_windowed_detail_offset_beyond_end_returns_empty_metadata(self, sqlite_pool: DatabasePool):
+        rows = _window_rows(2)
+        async with sqlite_pool.connection() as conn:
+            inserted_call_ids: set[str] = set()
+            for row in rows:
+                call_id = str(row["call_id"])
+                if call_id not in inserted_call_ids:
+                    await _insert_sqlite_call(
+                        conn,
+                        call_id,
+                        "session-window-empty",
+                        parse_db_ts(row["created_at"]).isoformat(),
+                    )
+                    inserted_call_ids.add(call_id)
+                await conn.execute(
+                    """
+                    INSERT INTO conversation_events (id, call_id, event_type, payload, session_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    f"empty-{row['call_id']}-{row['event_type']}",
+                    row["call_id"],
+                    row["event_type"],
+                    json.dumps(row["payload"]),
+                    "session-window-empty",
+                    parse_db_ts(row["created_at"]).isoformat(),
+                )
+
+        detail = await fetch_session_detail("session-window-empty", sqlite_pool, offset=99, limit=10)
+
+        assert detail.turns == []
+        assert detail.total_turns == 2
+        assert detail.offset == 99
+        assert detail.limit == 10
+        assert detail.has_more is True
 
 
 class TestGetEventSummary:
@@ -2175,9 +2733,7 @@ class TestFetchSessionDetail:
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
 
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(
-            [row for call_rows in rows_by_call.values() for row in call_rows]
-        )
+        _stub_event_rows(mock_conn, [row for call_rows in rows_by_call.values() for row in call_rows])
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
 
@@ -2216,7 +2772,7 @@ class TestFetchSessionDetail:
             for call_id in [call_range.call_id]
         ]
 
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+        _stub_event_rows(mock_conn, rows)
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
 
@@ -2302,9 +2858,7 @@ class TestFetchSessionDetail:
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
 
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(
-            [row for call_rows in rows_by_call.values() for row in call_rows]
-        )
+        _stub_event_rows(mock_conn, [row for call_rows in rows_by_call.values() for row in call_rows])
         mock_pool = MagicMock()
         mock_pool.is_sqlite = True
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -2344,7 +2898,7 @@ class TestFetchSessionDetail:
         ]
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+        _stub_event_rows(mock_conn, rows)
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
 
@@ -2384,7 +2938,7 @@ class TestFetchSessionDetail:
 
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(mock_rows)
+        _stub_event_rows(mock_conn, mock_rows)
 
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -2450,7 +3004,7 @@ class TestFetchSessionDetail:
         ]
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+        _stub_event_rows(mock_conn, rows)
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
 
@@ -2468,7 +3022,7 @@ class TestFetchSessionDetail:
     async def test_no_events_found(self):
         """Test error when no events found."""
         mock_conn = AsyncMock()
-        mock_conn.fetch.return_value = []
+        _stub_event_rows(mock_conn, [])
 
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -2490,7 +3044,7 @@ class TestFetchSessionDetail:
 
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(mock_rows)
+        _stub_event_rows(mock_conn, mock_rows)
 
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -2512,7 +3066,7 @@ class TestFetchSessionDetail:
 
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(mock_rows)
+        _stub_event_rows(mock_conn, mock_rows)
 
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -2534,7 +3088,7 @@ class TestFetchSessionDetail:
 
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(mock_rows)
+        _stub_event_rows(mock_conn, mock_rows)
 
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -2553,7 +3107,7 @@ class TestFetchSessionDetail:
         request_payload["original_request"] = request_payload["final_request"]
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+        _stub_event_rows(mock_conn, rows)
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
         expected = await fetch_session_detail("session-1", mock_pool)
@@ -2573,7 +3127,7 @@ class TestFetchSessionDetail:
         request_payload["original_request"] = request_payload["final_request"]
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+        _stub_event_rows(mock_conn, rows)
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
 
@@ -2594,7 +3148,7 @@ class TestFetchSessionDetail:
         rows = _equivalence_rows()
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+        _stub_event_rows(mock_conn, rows)
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
         expected = await fetch_session_detail("session-1", mock_pool)
@@ -2644,7 +3198,7 @@ class TestFetchSessionDetail:
         ]
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
-        mock_conn.fetch.side_effect = _fetch_from_event_rows(rows)
+        _stub_event_rows(mock_conn, rows)
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
         expected = await fetch_session_detail("session-1", mock_pool)

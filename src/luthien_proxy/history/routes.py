@@ -200,16 +200,18 @@ async def delete_user_label(
 @api_router.get("/sessions/{session_id}", responses={200: {"model": SessionDetail}})
 async def get_session(
     session_id: str,
+    offset: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
     _: str = Depends(verify_admin_token),
     db_pool: DatabasePool = Depends(get_db_pool),
 ) -> StreamingResponse:
-    """Get full session detail with conversation turns.
+    """Get a window of session turns in chronological display order.
 
-    Returns the complete conversation history for a session,
-    including all messages, tool calls, and policy annotations.
+    ``offset`` is a zero-based chronological turn offset. When omitted, the
+    newest page is returned. ``limit`` defaults to 50 and is capped at 200.
     """
     try:
-        stream = stream_session_detail_json(session_id, db_pool)
+        stream = stream_session_detail_json(session_id, db_pool, offset=offset, limit=limit)
         first_chunk = await anext(stream)
     except ValueError as e:
         logger.warning(f"Session not found: {repr(e)}")

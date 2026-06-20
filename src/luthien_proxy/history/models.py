@@ -168,6 +168,10 @@ class SessionDetail(BaseModel):
     turns: list[ConversationTurn]
     total_policy_interventions: int
     models_used: list[str]
+    total_turns: int = 0
+    offset: int = 0
+    limit: int = 50
+    has_more: bool = False
 
 
 __all__ = [
