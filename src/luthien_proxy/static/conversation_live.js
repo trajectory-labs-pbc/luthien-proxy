@@ -266,43 +266,15 @@ function conversationViewer() {
             this.turns = this.presentTurns(rawTurns);
         },
 
-        // Presentation pipeline: classify preflight turns and compute
-        // display messages (dedup) entirely on the client side.
-        //
-        // The API sends the full conversation history on every request:
-        //   Turn 1: [user₀]
-        //   Turn 2: [user₀, assistant₁, user₂]
-        //   Turn 3: [user₀, assistant₁, user₂, tool_call₂, tool_result₂, user₃]
-        //
-        // user₀ (the initial message with all preamble) is re-sent identically
-        // every turn. New content appears at the end, after the previous turn's
-        // messages. So for turn N, display = request_messages.slice(prevCount).
-        // Preflight turns are excluded from the count so they don't disrupt the
-        // sequence.
-        //
-        // Invariant: the API sends a stable, strictly-growing cumulative
-        // message array. If a policy rewrites or reorders earlier messages,
-        // the slicing will produce incorrect results.
+        // Presentation pipeline: classify preflight turns and use the server's
+        // transcript delta directly. The server applies the same running-count
+        // semantics this client used to apply: real turns advance the count;
+        // preflight turns render in full and do not advance the count.
         presentTurns(rawTurns) {
-            let prevRealMsgCount = 0;
-
             return rawTurns.map(turn => {
                 const isPreflight = this.classifyPreflight(turn);
                 const messages = turn.request_messages || [];
-
-                let displayMessages;
-                if (isPreflight) {
-                    displayMessages = messages;
-                } else {
-                    displayMessages = messages.slice(prevRealMsgCount);
-                    if (displayMessages.length === 0 && messages.length > 0) {
-                        console.warn('Dedup produced empty messages for turn', turn.call_id,
-                            '— cumulative array invariant may be violated');
-                    }
-                    prevRealMsgCount = messages.length;
-                }
-
-                return { ...turn, _isPreflight: isPreflight, _displayMessages: displayMessages };
+                return { ...turn, _isPreflight: isPreflight, _displayMessages: messages };
             });
         },
 
@@ -730,7 +702,7 @@ function conversationViewer() {
                 requestDiffHtml = this.renderDiffPanels(
                     'Request',
                     turn.original_request_messages,
-                    turn.request_messages
+                    turn.request_messages_full || turn.request_messages
                 );
             }
 

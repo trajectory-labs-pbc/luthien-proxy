@@ -1252,6 +1252,226 @@ class TestFetchSessionDetail:
     """Test fetching session detail from database."""
 
     @pytest.mark.asyncio
+    async def test_iter_session_turns_emits_request_message_deltas_with_preflight_excluded_from_count(self):
+        """Detail turns carry display-equivalent request deltas instead of cumulative history."""
+        ranges = [
+            CallEventRange(
+                call_id="call-1",
+                first_ts=datetime(2025, 1, 15, 10, 0, 0),
+                last_ts=datetime(2025, 1, 15, 10, 0, 0),
+            ),
+            CallEventRange(
+                call_id="preflight",
+                first_ts=datetime(2025, 1, 15, 10, 0, 30),
+                last_ts=datetime(2025, 1, 15, 10, 0, 30),
+            ),
+            CallEventRange(
+                call_id="call-2",
+                first_ts=datetime(2025, 1, 15, 10, 1, 0),
+                last_ts=datetime(2025, 1, 15, 10, 1, 0),
+            ),
+        ]
+        rows_by_call = {
+            "call-1": [
+                {
+                    "call_id": "call-1",
+                    "event_type": "transaction.request_recorded",
+                    "payload": {"final_request": {"messages": [{"role": "user", "content": "Hi"}]}},
+                    "created_at": ranges[0].first_ts,
+                }
+            ],
+            "preflight": [
+                {
+                    "call_id": "preflight",
+                    "event_type": "transaction.request_recorded",
+                    "payload": {
+                        "final_request": {
+                            "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "quota probe"}],
+                        }
+                    },
+                    "created_at": ranges[1].first_ts,
+                }
+            ],
+            "call-2": [
+                {
+                    "call_id": "call-2",
+                    "event_type": "transaction.request_recorded",
+                    "payload": {
+                        "original_request": {
+                            "messages": [
+                                {"role": "user", "content": "Hi"},
+                                {"role": "assistant", "content": "Hello!"},
+                                {"role": "user", "content": "Use forbidden tool"},
+                            ]
+                        },
+                        "final_request": {
+                            "messages": [
+                                {"role": "user", "content": "Hi"},
+                                {"role": "assistant", "content": "Hello!"},
+                                {"role": "user", "content": "Use safe tool"},
+                            ]
+                        },
+                    },
+                    "created_at": ranges[2].first_ts,
+                }
+            ],
+        }
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+
+        def fetch_rows(_query, _session_id, *args):
+            call_ids = args[0] if len(args) == 1 and isinstance(args[0], list) else list(args)
+            return [row for call_id in call_ids for row in rows_by_call[call_id]]
+
+        mock_conn.fetch.side_effect = fetch_rows
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        turns = [turn async for turn in iter_session_turns("session-1", mock_pool, ranges)]
+
+        request_contents = [[message.content for message in turn.request_messages] for turn in turns]
+        original_contents = [message.content for message in turns[2].original_request_messages or []]
+        final_full_contents = [message.content for message in turns[2].request_messages_full or []]
+        assert request_contents == [["Hi"], ["quota probe"], ["Hello!", "Use safe tool"]]
+        assert original_contents == ["Hi", "Hello!", "Use forbidden tool"]
+        assert final_full_contents == ["Hi", "Hello!", "Use safe tool"]
+        assert request_contents[0] + request_contents[2] == final_full_contents
+
+    @pytest.mark.asyncio
+    async def test_iter_session_turns_fetches_payloads_in_batches(self):
+        """Payload fetch query count grows by batch count, not by turn count."""
+        ranges = [
+            CallEventRange(
+                call_id=f"call-{index}",
+                first_ts=datetime(2025, 1, 15, 10, index, 0),
+                last_ts=datetime(2025, 1, 15, 10, index, 1),
+            )
+            for index in range(51)
+        ]
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+
+        def fetch_rows(_query, _session_id, *args):
+            call_ids = args[0] if len(args) == 1 and isinstance(args[0], list) else list(args)
+            return [
+                {
+                    "call_id": call_id,
+                    "event_type": "transaction.request_recorded",
+                    "payload": {"final_request": {"messages": [{"role": "user", "content": call_id}]}},
+                    "created_at": ranges[int(call_id.split("-")[1])].first_ts,
+                }
+                for call_id in call_ids
+            ]
+
+        mock_conn.fetch.side_effect = fetch_rows
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        turns = [turn async for turn in iter_session_turns("session-1", mock_pool, ranges)]
+
+        assert len(turns) == 51
+        assert mock_conn.fetch.await_count == 3
+        assert all("call_id = any($2)" in call.args[0].lower() for call in mock_conn.fetch.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_iter_session_turns_fetches_sqlite_payload_batches_with_expanded_in_clause(self):
+        ranges = [
+            CallEventRange(
+                call_id="call-1",
+                first_ts=datetime(2025, 1, 15, 10, 0, 0),
+                last_ts=datetime(2025, 1, 15, 10, 0, 10),
+            ),
+            CallEventRange(
+                call_id="call-2",
+                first_ts=datetime(2025, 1, 15, 10, 1, 0),
+                last_ts=datetime(2025, 1, 15, 10, 1, 10),
+            ),
+            CallEventRange(
+                call_id="call-3",
+                first_ts=datetime(2025, 1, 15, 10, 2, 0),
+                last_ts=datetime(2025, 1, 15, 10, 2, 10),
+            ),
+        ]
+        rows_by_call = {
+            "call-1": [
+                {
+                    "call_id": "call-1",
+                    "event_type": "transaction.request_recorded",
+                    "payload": {"final_request": {"messages": [{"role": "user", "content": "first"}]}},
+                    "created_at": ranges[0].first_ts,
+                }
+            ],
+            "call-2": [
+                {
+                    "call_id": "call-2",
+                    "event_type": "transaction.request_recorded",
+                    "payload": {
+                        "final_request": {
+                            "messages": [
+                                {"role": "user", "content": "first"},
+                                {"role": "user", "content": "second"},
+                            ]
+                        }
+                    },
+                    "created_at": ranges[1].first_ts,
+                },
+                {
+                    "call_id": "call-2",
+                    "event_type": "transaction.request_recorded",
+                    "payload": {
+                        "final_request": {
+                            "messages": [
+                                {"role": "user", "content": "first"},
+                                {"role": "user", "content": "late"},
+                            ]
+                        }
+                    },
+                    "created_at": datetime(2025, 1, 15, 10, 1, 30),
+                },
+            ],
+            "call-3": [
+                {
+                    "call_id": "call-3",
+                    "event_type": "transaction.request_recorded",
+                    "payload": {
+                        "final_request": {
+                            "messages": [
+                                {"role": "user", "content": "first"},
+                                {"role": "user", "content": "second"},
+                                {"role": "user", "content": "third"},
+                            ]
+                        }
+                    },
+                    "created_at": ranges[2].first_ts,
+                }
+            ],
+        }
+        mock_conn = AsyncMock()
+        _enable_mock_transaction(mock_conn)
+
+        def fetch_rows(_query, _session_id, *call_ids):
+            return [row for call_id in call_ids for row in rows_by_call[call_id]]
+
+        mock_conn.fetch.side_effect = fetch_rows
+        mock_pool = MagicMock()
+        mock_pool.is_sqlite = True
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        turns = [turn async for turn in iter_session_turns("session-1", mock_pool, ranges)]
+
+        query, session_id, *call_ids = mock_conn.fetch.await_args.args
+        assert [turn.call_id for turn in turns] == ["call-1", "call-2", "call-3"]
+        assert [[message.content for message in turn.request_messages] for turn in turns] == [
+            ["first"],
+            ["second"],
+            ["third"],
+        ]
+        assert "call_id IN ($2, $3, $4)" in query
+        assert session_id == "session-1"
+        assert call_ids == ["call-1", "call-2", "call-3"]
+
+    @pytest.mark.asyncio
     async def test_iter_session_turns_bounds_reads_to_snapshot_last_timestamp(self):
         """Per-call streaming reads are bounded by the enumerated snapshot."""
         first_ts = datetime(2025, 1, 15, 10, 0, 0)
@@ -1263,7 +1483,13 @@ class TestFetchSessionDetail:
                 "event_type": "transaction.request_recorded",
                 "payload": {"final_request": {"messages": [{"role": "user", "content": "first"}]}},
                 "created_at": first_ts,
-            }
+            },
+            {
+                "call_id": "call-1",
+                "event_type": "transaction.request_recorded",
+                "payload": {"final_request": {"messages": [{"role": "user", "content": "late"}]}},
+                "created_at": datetime(2025, 1, 15, 10, 2, 0),
+            },
         ]
         mock_conn = AsyncMock()
         _enable_mock_transaction(mock_conn)
@@ -1273,12 +1499,12 @@ class TestFetchSessionDetail:
 
         turns = [turn async for turn in iter_session_turns("session-1", mock_pool, ranges)]
 
-        query, session_id, call_id, upper_bound = mock_conn.fetch.await_args.args
+        query, session_id, call_ids = mock_conn.fetch.await_args.args
         assert len(turns) == 1
-        assert "created_at <= $3" in query
+        assert [message.content for message in turns[0].request_messages] == ["first"]
+        assert "call_id = ANY($2)" in query
         assert session_id == "session-1"
-        assert call_id == "call-1"
-        assert upper_bound == snapshot_last
+        assert call_ids == ["call-1"]
 
     @pytest.mark.asyncio
     async def test_successful_fetch(self):
@@ -1316,6 +1542,74 @@ class TestFetchSessionDetail:
         assert result.session_id == "session-1"
         assert len(result.turns) == 1
         assert result.turns[0].model == "gpt-4"
+
+    @pytest.mark.asyncio
+    async def test_fetch_session_detail_emits_multi_turn_request_message_deltas(self):
+        rows = [
+            {
+                "call_id": "call-1",
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_request": {"messages": [{"role": "user", "content": "Plan trip"}]},
+                },
+                "created_at": datetime(2025, 1, 15, 10, 0, 0),
+            },
+            {
+                "call_id": "preflight",
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_request": {
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "quota probe"}],
+                    }
+                },
+                "created_at": datetime(2025, 1, 15, 10, 0, 30),
+            },
+            {
+                "call_id": "call-2",
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_request": {
+                        "messages": [
+                            {"role": "user", "content": "Plan trip"},
+                            {"role": "assistant", "content": "Where to?"},
+                            {"role": "user", "content": "Lisbon"},
+                        ]
+                    }
+                },
+                "created_at": datetime(2025, 1, 15, 10, 1, 0),
+            },
+            {
+                "call_id": "call-3",
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_request": {
+                        "messages": [
+                            {"role": "user", "content": "Plan trip"},
+                            {"role": "assistant", "content": "Where to?"},
+                            {"role": "user", "content": "Lisbon"},
+                            {"role": "assistant", "content": "Which dates?"},
+                            {"role": "user", "content": "May"},
+                        ]
+                    }
+                },
+                "created_at": datetime(2025, 1, 15, 10, 2, 0),
+            },
+        ]
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = rows
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        result = await fetch_session_detail("session-1", mock_pool)
+
+        assert [turn.call_id for turn in result.turns] == ["call-1", "preflight", "call-2", "call-3"]
+        assert [[message.content for message in turn.request_messages] for turn in result.turns] == [
+            ["Plan trip"],
+            ["quota probe"],
+            ["Where to?", "Lisbon"],
+            ["Which dates?", "May"],
+        ]
 
     @pytest.mark.asyncio
     async def test_no_events_found(self):
@@ -1406,8 +1700,7 @@ class TestFetchSessionDetail:
                 {"call_id": "call-1", "first_ts": rows[0]["created_at"], "last_ts": rows[1]["created_at"]},
                 {"call_id": "call-2", "first_ts": rows[2]["created_at"], "last_ts": rows[4]["created_at"]},
             ],
-            rows[:2],
-            rows[2:],
+            rows,
         ]
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -1441,10 +1734,10 @@ class TestFetchSessionDetail:
         queries = [call.args[0].lower() for call in mock_conn.fetch.call_args_list]
         assert "payload" not in queries[0]
         payload_queries = [query for query in queries[1:] if "payload" in query]
-        assert len(payload_queries) == 2
-        for call in mock_conn.fetch.call_args_list[1:]:
-            assert call.args[1] == "session-1"
-            assert call.args[2] in {"call-1", "call-2"}
+        assert len(payload_queries) == 1
+        payload_call = mock_conn.fetch.call_args_list[1]
+        assert payload_call.args[1] == "session-1"
+        assert payload_call.args[2] == ["call-1", "call-2"]
 
     @pytest.mark.asyncio
     async def test_streamed_exports_match_existing_export_output(self):
@@ -1461,13 +1754,10 @@ class TestFetchSessionDetail:
         mock_conn.fetch.side_effect = [
             rows,
             metadata,
-            rows[:2],
-            rows[2:],
-            rows[:2],
-            rows[2:],
+            rows,
+            rows,
             metadata,
-            rows[:2],
-            rows[2:],
+            rows,
         ]
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
@@ -1525,15 +1815,10 @@ class TestFetchSessionDetail:
         mock_conn.fetch.side_effect = [
             rows,
             ranges,
-            [rows[0], rows[3]],
-            [rows[1], rows[2]],
+            rows,
             ranges,
-            [rows[0], rows[3]],
-            [rows[1], rows[2]],
-            [rows[0], rows[3]],
-            [rows[1], rows[2]],
-            [rows[0], rows[3]],
-            [rows[1], rows[2]],
+            rows,
+            rows,
         ]
         mock_pool = MagicMock()
         mock_pool.connection.return_value.__aenter__.return_value = mock_conn
