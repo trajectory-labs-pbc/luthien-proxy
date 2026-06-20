@@ -144,7 +144,10 @@ function conversationViewer() {
                 this.updateTimestamp();
                 this.renderTurns();
                 this.$nextTick(() => {
-                    this.autoScrollToBottom();
+                    // Instant jump to the newest turn. A smooth scroll animates
+                    // scrollY up from 0 and the early frames (scrollY < 80) would
+                    // spuriously fire the load-older listener even with the guard set.
+                    window.scrollTo(0, document.documentElement.scrollHeight);
                     this.initialLoadComplete = true;
                 });
             } catch (err) {
