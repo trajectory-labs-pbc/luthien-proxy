@@ -105,8 +105,8 @@ function conversationViewer() {
                 }
             });
 
-            container.addEventListener('scroll', () => {
-                if (container.scrollTop < 80) {
+            window.addEventListener('scroll', () => {
+                if (window.scrollY < 80) {
                     this.loadOlderTurns();
                 }
             });
@@ -297,8 +297,7 @@ function conversationViewer() {
         async loadOlderTurns() {
             if (this.loadingOlder || this.loadedOffset <= 0) return;
             this.loadingOlder = true;
-            const container = document.getElementById('conversation-container');
-            const oldHeight = container.scrollHeight;
+            const oldHeight = document.documentElement.scrollHeight;
             try {
                 const nextOffset = Math.max(0, this.loadedOffset - this.pageLimit);
                 const nextLimit = this.loadedOffset - nextOffset;
@@ -314,7 +313,7 @@ function conversationViewer() {
                 this.updateStats(data);
                 this.renderTurns();
                 this.$nextTick(() => {
-                    container.scrollTop += container.scrollHeight - oldHeight;
+                    window.scrollBy(0, document.documentElement.scrollHeight - oldHeight);
                 });
             } catch (err) {
                 console.error('Failed to load older turns:', err);
