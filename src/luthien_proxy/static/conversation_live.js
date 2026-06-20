@@ -31,6 +31,11 @@ function conversationViewer() {
         renderedCallIds: new Set(),
         turnFingerprints: {},
         _rawTurns: [],
+        pageLimit: 50,
+        totalTurns: 0,
+        loadedOffset: 0,
+        loadedEnd: 0,
+        loadingOlder: false,
 
         init() {
             const pathParts = window.location.pathname.split('/');
@@ -99,14 +104,27 @@ function conversationViewer() {
                     return;
                 }
             });
+
+            container.addEventListener('scroll', () => {
+                if (container.scrollTop < 80) {
+                    this.loadOlderTurns();
+                }
+            });
+        },
+
+        async fetchPage(offset = null, limit = this.pageLimit) {
+            const params = new URLSearchParams({ limit: String(limit) });
+            if (offset !== null && offset !== undefined) params.set('offset', String(offset));
+            const resp = await fetch(
+                `/api/history/sessions/${encodeURIComponent(this.conversationId)}?${params.toString()}`,
+                { headers: { 'Accept': 'application/json' } }
+            );
+            return resp;
         },
 
         async loadInitial() {
             try {
-                const resp = await fetch(
-                    `/api/history/sessions/${encodeURIComponent(this.conversationId)}`,
-                    { headers: { 'Accept': 'application/json' } }
-                );
+                const resp = await this.fetchPage(null, this.pageLimit);
 
                 if (!resp.ok) {
                     if (resp.status === 403) {
@@ -119,6 +137,7 @@ function conversationViewer() {
                 }
 
                 const data = await resp.json();
+                this.pageLimit = data.limit || this.pageLimit;
                 this.processTurns(data);
                 this.updateStats(data);
                 this.updateTimestamp();
@@ -201,10 +220,7 @@ function conversationViewer() {
 
         async refreshTurns() {
             try {
-                const resp = await fetch(
-                    `/api/history/sessions/${encodeURIComponent(this.conversationId)}`,
-                    { headers: { 'Accept': 'application/json' } }
-                );
+                const resp = await this.fetchPage(null, this.pageLimit);
                 if (!resp.ok) return;
                 const data = await resp.json();
                 const rawTurns = data.turns || [];
@@ -212,8 +228,8 @@ function conversationViewer() {
                 if (rawTurns.length !== newTurns.length) {
                     console.error('presentTurns must map 1:1 with rawTurns');
                 }
-                this._rawTurns = rawTurns;
-                this.turns = newTurns;
+                this.totalTurns = data.total_turns || rawTurns.length;
+                this.pageLimit = data.limit || this.pageLimit;
 
                 this.updateStats(data);
                 this.updateTimestamp();
@@ -234,19 +250,28 @@ function conversationViewer() {
                 for (let i = 0; i < newTurns.length; i++) {
                     const turn = newTurns[i];
                     const fp = JSON.stringify(rawTurns[i]);
+                    const globalIndex = (data.offset || 0) + i;
+                    const localIndex = globalIndex - this.loadedOffset;
                     if (this.renderedCallIds.has(turn.call_id)) {
+                        if (localIndex >= 0 && localIndex < this.turns.length) {
+                            this.turns[localIndex] = turn;
+                            this._rawTurns[localIndex] = rawTurns[i];
+                        }
                         if (fp !== this.turnFingerprints[turn.call_id]) {
                             const existing = container.querySelector(`[data-call-id="${CSS.escape(turn.call_id)}"]`);
                             if (existing) {
-                                existing.outerHTML = this.renderTurn(turn, i + 1);
+                                existing.outerHTML = this.renderTurn(turn, globalIndex + 1);
                             }
                             this.turnFingerprints[turn.call_id] = fp;
                         }
                     } else {
-                        // New turn — append
+                        if (globalIndex < this.loadedOffset) continue;
                         this.renderedCallIds.add(turn.call_id);
                         this.turnFingerprints[turn.call_id] = fp;
-                        const html = this.renderTurn(turn, i + 1);
+                        this._rawTurns.push(rawTurns[i]);
+                        this.turns.push(turn);
+                        this.loadedEnd = Math.max(this.loadedEnd, globalIndex + 1);
+                        const html = this.renderTurn(turn, globalIndex + 1);
                         container.insertAdjacentHTML('beforeend', html);
                         const newEl = container.lastElementChild;
                         if (newEl) newEl.classList.add('new-turn');
@@ -264,6 +289,38 @@ function conversationViewer() {
             const rawTurns = data.turns || [];
             this._rawTurns = rawTurns;
             this.turns = this.presentTurns(rawTurns);
+            this.totalTurns = data.total_turns || rawTurns.length;
+            this.loadedOffset = data.offset || 0;
+            this.loadedEnd = this.loadedOffset + rawTurns.length;
+        },
+
+        async loadOlderTurns() {
+            if (this.loadingOlder || this.loadedOffset <= 0) return;
+            this.loadingOlder = true;
+            const container = document.getElementById('conversation-container');
+            const oldHeight = container.scrollHeight;
+            try {
+                const nextOffset = Math.max(0, this.loadedOffset - this.pageLimit);
+                const nextLimit = this.loadedOffset - nextOffset;
+                const resp = await this.fetchPage(nextOffset, nextLimit);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const rawTurns = data.turns || [];
+                const olderTurns = this.presentTurns(rawTurns);
+                this._rawTurns = [...rawTurns, ...this._rawTurns];
+                this.turns = [...olderTurns, ...this.turns];
+                this.loadedOffset = data.offset || nextOffset;
+                this.totalTurns = data.total_turns || this.totalTurns;
+                this.updateStats(data);
+                this.renderTurns();
+                this.$nextTick(() => {
+                    container.scrollTop += container.scrollHeight - oldHeight;
+                });
+            } catch (err) {
+                console.error('Failed to load older turns:', err);
+            } finally {
+                this.loadingOlder = false;
+            }
         },
 
         // Presentation pipeline: classify preflight turns and use the server's
@@ -295,8 +352,7 @@ function conversationViewer() {
         },
 
         updateStats(data) {
-            const realTurns = this.turns.filter(t => !t._isPreflight);
-            this.stats.turns = realTurns.length;
+            this.stats.turns = data.total_turns || this.totalTurns || this.turns.filter(t => !t._isPreflight).length;
             this.stats.interventions = data.total_policy_interventions || 0;
             this.stats.models = [...new Set(data.models_used || [])];
             this.stats.events = Object.values(this.rawEvents).reduce((sum, events) => sum + events.length, 0);
@@ -403,7 +459,7 @@ function conversationViewer() {
             }
 
             const savedState = this.snapshotExpandState();
-            container.innerHTML = this.turns.map((turn, i) => this.renderTurn(turn, i + 1)).join('');
+            container.innerHTML = this.turns.map((turn, i) => this.renderTurn(turn, this.loadedOffset + i + 1)).join('');
             this.restoreExpandState(savedState);
         },
 

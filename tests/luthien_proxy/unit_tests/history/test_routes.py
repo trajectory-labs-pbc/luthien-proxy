@@ -252,17 +252,23 @@ class TestGetSessionRoute:
             ],
             total_policy_interventions=0,
             models_used=["gpt-4"],
+            total_turns=1,
+            offset=0,
+            limit=50,
+            has_more=False,
         )
 
         with patch(
             "luthien_proxy.history.routes.stream_session_detail_json",
             return_value=_single_chunk_stream(expected_detail.model_dump_json()),
         ) as mock_stream:
-            result = await get_session(session_id="test-session", _=AUTH_TOKEN, db_pool=mock_db_pool)
+            result = await get_session(
+                session_id="test-session", offset=10, limit=25, _=AUTH_TOKEN, db_pool=mock_db_pool
+            )
 
             body = await _collect_streaming_body(result)
             assert json.loads(body) == expected_detail.model_dump(mode="json")
-            mock_stream.assert_called_once_with("test-session", mock_db_pool)
+            mock_stream.assert_called_once_with("test-session", mock_db_pool, offset=10, limit=25)
 
     @pytest.mark.asyncio
     async def test_get_session_not_found(self):
@@ -274,7 +280,7 @@ class TestGetSessionRoute:
             return_value=_raising_stream(ValueError("No events found for session_id: nonexistent")),
         ):
             with pytest.raises(HTTPException) as exc_info:
-                await get_session(session_id="nonexistent", _=AUTH_TOKEN, db_pool=mock_db_pool)
+                await get_session(session_id="nonexistent", offset=None, limit=50, _=AUTH_TOKEN, db_pool=mock_db_pool)
 
             assert exc_info.value.status_code == 404
             assert exc_info.value.detail == "Session not found."
