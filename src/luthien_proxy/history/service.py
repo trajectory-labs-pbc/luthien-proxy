@@ -59,6 +59,23 @@ class RequestDeltaState:
     prev_real_msg_count: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class RequestProjection:
+    call_id: str
+    first_ts: datetime
+    request_ts: datetime
+    final_model: str | None
+    request_params: dict[str, Any]
+    raw_msg_count: int
+    request_was_modified: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FastPathPlan:
+    anchor: RequestProjection
+    preflights: list[RequestProjection]
+
+
 logger = logging.getLogger(__name__)
 _SUMMARY_BACKFILLED_POOLS: weakref.WeakSet[DatabasePool] = weakref.WeakSet()
 _SUMMARY_PREVIEWS_BACKFILLED_POOLS: weakref.WeakSet[DatabasePool] = weakref.WeakSet()
@@ -196,70 +213,50 @@ def _parse_request_messages(request: dict[str, Any]) -> list[ConversationMessage
     raw_messages = request.get("messages", [])
 
     for msg in raw_messages:
-        role = msg.get("role", "")
-        msg_type = _ROLE_TO_MESSAGE_TYPE.get(role, MessageType.UNKNOWN)
-        if msg_type == MessageType.UNKNOWN:
-            raise ValueError(f"Unrecognized message role: '{role}'")
-
-        content = extract_text_content(msg.get("content"))
-
-        # For OpenAI-style tool results, include the tool_call_id
-        tool_call_id = msg.get("tool_call_id") if msg_type == MessageType.TOOL_RESULT else None
-
-        # For assistant messages, extract any tool calls first
-        if msg_type == MessageType.ASSISTANT:
-            tool_call_msgs = _extract_tool_calls(msg)
-            if tool_call_msgs:
-                messages.extend(tool_call_msgs)
-                if content:
-                    messages.append(
-                        ConversationMessage(
-                            message_type=msg_type,
-                            content=content,
-                        )
-                    )
-                continue
-
-        # Anthropic-style tool results: user messages with tool_result content blocks.
-        # Split these into separate TOOL_RESULT messages with their tool_use_id
-        # so the frontend can pair them with tool calls.
-        if msg_type == MessageType.USER:
-            raw_content = msg.get("content")
-            if isinstance(raw_content, list):
-                has_tool_results = any(b.get("type") == "tool_result" for b in raw_content)
-                if has_tool_results:
-                    for block in raw_content:
-                        if block.get("type") == "tool_result":
-                            result_content = block.get("content")
-                            text = extract_text_content(result_content) if result_content is not None else ""
-                            # False/None → None; only True propagates
-                            is_error = block.get("is_error") or None
-                            messages.append(
-                                ConversationMessage(
-                                    message_type=MessageType.TOOL_RESULT,
-                                    content=text,
-                                    tool_call_id=block.get("tool_use_id"),
-                                    is_error=is_error,
-                                )
-                            )
-                        elif block.get("type") == "text" and block.get("text", "").strip():
-                            messages.append(
-                                ConversationMessage(
-                                    message_type=MessageType.USER,
-                                    content=block["text"],
-                                )
-                            )
-                    continue
-
-        messages.append(
-            ConversationMessage(
-                message_type=msg_type,
-                content=content,
-                tool_call_id=tool_call_id,
-            )
-        )
+        messages.extend(_parse_raw_request_message(msg))
 
     return messages
+
+
+def _parse_raw_request_message(msg: dict[str, Any]) -> list[ConversationMessage]:
+    role = msg.get("role", "")
+    msg_type = _ROLE_TO_MESSAGE_TYPE.get(role, MessageType.UNKNOWN)
+    if msg_type == MessageType.UNKNOWN:
+        raise ValueError(f"Unrecognized message role: '{role}'")
+
+    content = extract_text_content(msg.get("content"))
+    tool_call_id = msg.get("tool_call_id") if msg_type == MessageType.TOOL_RESULT else None
+    if msg_type == MessageType.ASSISTANT:
+        tool_call_msgs = _extract_tool_calls(msg)
+        if tool_call_msgs:
+            if content:
+                return [*tool_call_msgs, ConversationMessage(message_type=msg_type, content=content)]
+            return tool_call_msgs
+
+    if msg_type == MessageType.USER:
+        raw_content = msg.get("content")
+        if isinstance(raw_content, list):
+            has_tool_results = any(b.get("type") == "tool_result" for b in raw_content)
+            if has_tool_results:
+                parsed: list[ConversationMessage] = []
+                for block in raw_content:
+                    if block.get("type") == "tool_result":
+                        result_content = block.get("content")
+                        text = extract_text_content(result_content) if result_content is not None else ""
+                        is_error = block.get("is_error") or None
+                        parsed.append(
+                            ConversationMessage(
+                                message_type=MessageType.TOOL_RESULT,
+                                content=text,
+                                tool_call_id=block.get("tool_use_id"),
+                                is_error=is_error,
+                            )
+                        )
+                    elif block.get("type") == "text" and block.get("text", "").strip():
+                        parsed.append(ConversationMessage(message_type=MessageType.USER, content=block["text"]))
+                return parsed
+
+    return [ConversationMessage(message_type=msg_type, content=content, tool_call_id=tool_call_id)]
 
 
 def _parse_response_messages(response: dict[str, Any]) -> list[ConversationMessage]:
@@ -1194,69 +1191,21 @@ async def fetch_session_detail(session_id: str, db_pool: DatabasePool) -> Sessio
     Raises:
         ValueError: If no events found for session_id
     """
-    async with db_pool.connection() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT call_id, event_type, payload, created_at
-            FROM conversation_events
-            WHERE session_id = $1
-            ORDER BY created_at ASC
-            """,
-            session_id,
-        )
-
-    if not rows:
-        raise ValueError(f"No events found for session_id: {session_id}")
-
-    # Group events by call_id
-    calls: dict[str, list[StoredEvent]] = {}
-    for row in rows:
-        call_id = str(row["call_id"])
-        if call_id not in calls:
-            calls[call_id] = []
-
-        raw_payload = row["payload"]
-        if isinstance(raw_payload, dict):
-            payload: dict[str, object] = dict(raw_payload)
-        elif isinstance(raw_payload, str):
-            payload = json.loads(raw_payload)
-        else:
-            raise TypeError(f"Unexpected payload type: {type(raw_payload).__name__}")
-
-        raw_created_at = parse_db_ts(row["created_at"])
-
-        calls[call_id].append(
-            StoredEvent(
-                event_type=str(row["event_type"]),
-                payload=payload,
-                created_at=raw_created_at,
-            )
-        )
-
-    # Build conversation turns, sorted by first event timestamp
+    ranges = await _fetch_call_ranges(session_id, db_pool)
     turns: list[ConversationTurn] = []
     all_models = set()
     total_interventions = 0
-    delta_state = RequestDeltaState()
-
-    # Sort call_ids by their first event timestamp to ensure chronological order
-    sorted_call_ids = sorted(calls.keys(), key=lambda cid: calls[cid][0]["created_at"])
-    for call_id in sorted_call_ids:
-        full_turn = _build_turn(call_id, calls[call_id])
-        turn, delta_state = _apply_request_delta(full_turn, delta_state)
+    async for turn in iter_session_turns(session_id, db_pool, ranges):
         turns.append(turn)
         if turn.model:
             all_models.add(turn.model)
         if turn.had_policy_intervention:
             total_interventions += len(turn.annotations)
 
-    first_ts_str = parse_db_ts(rows[0]["created_at"]).isoformat()
-    last_ts_str = parse_db_ts(rows[-1]["created_at"]).isoformat()
-
     return SessionDetail(
         session_id=session_id,
-        first_timestamp=first_ts_str,
-        last_timestamp=last_ts_str,
+        first_timestamp=ranges[0].first_ts.isoformat(),
+        last_timestamp=_last_timestamp_from_ranges(ranges).isoformat(),
         turns=turns,
         total_policy_interventions=total_interventions,
         models_used=sorted(all_models),
@@ -1297,6 +1246,122 @@ def _is_preflight_turn(turn: ConversationTurn) -> bool:
     if output_format.get("type") != "json_schema":
         return False
     return isinstance(max_tokens, int) and max_tokens <= 256
+
+
+def _is_preflight_projection(projection: RequestProjection) -> bool:
+    max_tokens = projection.request_params.get("max_tokens")
+    if max_tokens == 1:
+        return True
+    output_config = projection.request_params.get("output_config")
+    if not isinstance(output_config, dict):
+        return False
+    output_format = output_config.get("format")
+    if not isinstance(output_format, dict):
+        return False
+    if output_format.get("type") != "json_schema":
+        return False
+    return isinstance(max_tokens, int) and max_tokens <= 256
+
+
+def _select_fast_path_anchor(projections: Sequence[RequestProjection]) -> FastPathPlan | None:
+    real_projections: list[RequestProjection] = []
+    preflights: list[RequestProjection] = []
+    previous_count = 0
+    for projection in projections:
+        if projection.request_was_modified:
+            return None
+        if _is_preflight_projection(projection):
+            preflights.append(projection)
+            continue
+        if projection.raw_msg_count < previous_count:
+            return None
+        previous_count = projection.raw_msg_count
+        real_projections.append(projection)
+    if not real_projections:
+        return None
+    anchor = max(real_projections, key=lambda projection: projection.raw_msg_count)
+    return FastPathPlan(anchor=anchor, preflights=preflights)
+
+
+def _parsed_prefixes_by_raw_count(raw_messages: Sequence[dict[str, Any]]) -> dict[int, list[ConversationMessage]]:
+    parsed_messages: list[ConversationMessage] = []
+    prefixes: dict[int, list[ConversationMessage]] = {0: []}
+    for index, raw_message in enumerate(raw_messages, start=1):
+        parsed_messages.extend(_parse_raw_request_message(raw_message))
+        prefixes[index] = list(parsed_messages)
+    return prefixes
+
+
+def _turn_from_projection(
+    projection: RequestProjection,
+    events: list[StoredEvent],
+    request_messages: list[ConversationMessage],
+) -> ConversationTurn:
+    response_messages: list[ConversationMessage] = []
+    original_response_messages: list[ConversationMessage] | None = None
+    annotations: list[PolicyAnnotation] = []
+    response_was_modified = False
+    for event in events:
+        event_type = event["event_type"]
+        payload = event["payload"]
+        if event_type in (
+            "transaction.streaming_response_recorded",
+            "transaction.non_streaming_response_recorded",
+        ):
+            final_resp = payload.get("final_response")
+            if final_resp is None:
+                raise KeyError(f"{event_type} missing 'final_response'")
+            response_messages = _parse_response_messages(final_resp)
+            original_resp = payload.get("original_response")
+            if original_resp is not None and original_resp != final_resp:
+                response_was_modified = True
+                original_response_messages = _parse_response_messages(original_resp)
+        elif event_type.startswith("policy."):
+            if "evaluation" in event_type:
+                continue
+            annotations.append(
+                PolicyAnnotation(
+                    policy_name=_extract_policy_name(event_type),
+                    event_type=event_type,
+                    summary=_get_event_summary(event_type, payload),
+                    details=payload if payload else None,
+                )
+            )
+    return ConversationTurn(
+        call_id=projection.call_id,
+        timestamp=projection.first_ts.isoformat(),
+        model=projection.final_model,
+        request_messages=request_messages,
+        response_messages=response_messages,
+        annotations=annotations,
+        had_policy_intervention=response_was_modified or bool(annotations),
+        request_was_modified=False,
+        response_was_modified=response_was_modified,
+        original_response_messages=original_response_messages,
+        request_params=projection.request_params,
+    )
+
+
+async def _iter_session_turns_fast(
+    projections: Sequence[RequestProjection],
+    events_by_call_id: Mapping[str, list[StoredEvent]],
+    messages_by_call_id: Mapping[str, list[dict[str, Any]]],
+) -> AsyncIterator[ConversationTurn]:
+    plan = _select_fast_path_anchor(projections)
+    if plan is None:
+        return
+    anchor_messages = messages_by_call_id[plan.anchor.call_id]
+    prefixes = _parsed_prefixes_by_raw_count(anchor_messages)
+    previous_real_count = 0
+    for projection in projections:
+        if _is_preflight_projection(projection):
+            request_messages = _parse_request_messages({"messages": messages_by_call_id[projection.call_id]})
+        else:
+            current_prefix = prefixes[projection.raw_msg_count]
+            previous_prefix = prefixes[previous_real_count]
+            request_messages = current_prefix[len(previous_prefix) :]
+            previous_real_count = projection.raw_msg_count
+        yield _turn_from_projection(projection, events_by_call_id.get(projection.call_id, []), request_messages)
 
 
 def _apply_request_delta(
@@ -1371,6 +1436,270 @@ async def _fetch_turn_batch_rows(
     return grouped
 
 
+async def _fetch_non_request_event_rows(
+    conn: Any, session_id: str, ranges: Sequence[CallEventRange], *, is_sqlite: bool
+) -> dict[str, list[Mapping[str, object]]]:
+    if not ranges:
+        return {}
+    if is_sqlite:
+        placeholders = ", ".join(f"${index}" for index in range(2, len(ranges) + 2))
+        rows = await conn.fetch(
+            f"""
+            SELECT call_id, event_type, payload, created_at
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id IN ({placeholders}) AND event_type <> 'transaction.request_recorded'
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            *(call_range.call_id for call_range in ranges),
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT call_id, event_type, payload, created_at
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id = ANY($2) AND event_type <> 'transaction.request_recorded'
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            [call_range.call_id for call_range in ranges],
+        )
+    range_by_call_id = {call_range.call_id: call_range for call_range in ranges}
+    grouped: dict[str, list[Mapping[str, object]]] = {call_range.call_id: [] for call_range in ranges}
+    for row in rows:
+        call_id = str(row["call_id"])
+        call_range = range_by_call_id.get(call_id)
+        if call_range is not None and parse_db_ts(row["created_at"]) <= call_range.last_ts:
+            grouped[call_id].append(row)
+    return grouped
+
+
+def _json_obj(raw_value: object) -> dict[str, Any] | None:
+    if isinstance(raw_value, dict):
+        return dict(raw_value)
+    if isinstance(raw_value, str):
+        parsed = json.loads(raw_value)
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _json_list(raw_value: object) -> list[dict[str, Any]]:
+    parsed: object = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+    if not isinstance(parsed, list):
+        raise TypeError(f"Expected request messages list, got {type(parsed).__name__}")
+    return [dict(item) for item in parsed if isinstance(item, dict)]
+
+
+@dataclass(frozen=True, slots=True)
+class _OmittedRequestParam:
+    pass
+
+
+_OMITTED_REQUEST_PARAM = _OmittedRequestParam()
+
+
+def _request_param_is_present(row: Mapping[str, object], key: str) -> bool:
+    present_value = row.get(f"{key}_present")
+    if isinstance(present_value, bool):
+        return present_value
+    if isinstance(present_value, int):
+        return bool(present_value)
+    return row.get(key) is not None
+
+
+def _raw_request_param(raw_value: Any) -> Any | _OmittedRequestParam:
+    return raw_value
+
+
+def _bool_request_param(raw_value: Any) -> Any | _OmittedRequestParam:
+    if isinstance(raw_value, bool):
+        return raw_value
+    if type(raw_value) is int and raw_value in (0, 1):
+        return bool(raw_value)
+    return raw_value
+
+
+def _json_list_request_param(raw_value: Any) -> Any | _OmittedRequestParam:
+    if isinstance(raw_value, str):
+        try:
+            parsed_value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return raw_value
+        return parsed_value if isinstance(parsed_value, list) else raw_value
+    return raw_value
+
+
+def _output_config_request_param(raw_value: Any) -> Any | _OmittedRequestParam:
+    if raw_value is None:
+        return None
+    output_config = _json_obj(raw_value)
+    if output_config is None:
+        return _OMITTED_REQUEST_PARAM
+    output_format = output_config.get("format")
+    if not isinstance(output_format, dict):
+        return _OMITTED_REQUEST_PARAM
+    return {"format": {"type": output_format.get("type")}}
+
+
+def _projection_params_from_row(row: Mapping[str, object]) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for key in _REQUEST_PARAM_ALLOWLIST:
+        if not _request_param_is_present(row, key):
+            continue
+        normalized_value = _REQUEST_PARAM_NORMALIZERS[key](row.get(key))
+        if normalized_value is not _OMITTED_REQUEST_PARAM:
+            params[key] = normalized_value
+    tools_count = row.get("tools_count")
+    if isinstance(tools_count, int):
+        params["tools_count"] = tools_count
+    return params
+
+
+def _projection_from_row(row: Mapping[str, object]) -> RequestProjection:
+    raw_msg_count = row["raw_msg_count"]
+    if not isinstance(raw_msg_count, int):
+        raise TypeError(f"Expected raw_msg_count int, got {type(raw_msg_count).__name__}")
+    return RequestProjection(
+        call_id=str(row["call_id"]),
+        first_ts=parse_db_ts(row["first_ts"]),
+        request_ts=parse_db_ts(row["request_ts"]),
+        final_model=str(row["final_model"]) if row.get("final_model") is not None else None,
+        request_params=_projection_params_from_row(row),
+        raw_msg_count=raw_msg_count,
+        request_was_modified=bool(row["request_was_modified"]),
+    )
+
+
+async def _fetch_request_projections(
+    conn: Any, session_id: str, ranges: Sequence[CallEventRange], *, is_sqlite: bool
+) -> list[RequestProjection]:
+    if not ranges:
+        return []
+    if is_sqlite:
+        placeholders = ", ".join(f"${index}" for index in range(2, len(ranges) + 2))
+        rows = await conn.fetch(
+            f"""
+            SELECT call_id,
+                   MIN(created_at) OVER (PARTITION BY call_id) AS first_ts,
+                   created_at AS request_ts,
+                   json_extract(payload, '$.final_model') AS final_model,
+                   json_extract(payload, '$.final_request.model') AS model,
+                   json_extract(payload, '$.final_request.max_tokens') AS max_tokens,
+                   json_extract(payload, '$.final_request.stream') AS stream,
+                   json_extract(payload, '$.final_request.temperature') AS temperature,
+                   json_extract(payload, '$.final_request.top_p') AS top_p,
+                   json_extract(payload, '$.final_request.top_k') AS top_k,
+                   json_extract(payload, '$.final_request.stop_sequences') AS stop_sequences,
+                   json_extract(payload, '$.final_request.output_config') AS output_config,
+                   json_type(payload, '$.final_request.model') IS NOT NULL AS model_present,
+                   json_type(payload, '$.final_request.max_tokens') IS NOT NULL AS max_tokens_present,
+                   json_type(payload, '$.final_request.stream') IS NOT NULL AS stream_present,
+                   json_type(payload, '$.final_request.temperature') IS NOT NULL AS temperature_present,
+                   json_type(payload, '$.final_request.top_p') IS NOT NULL AS top_p_present,
+                   json_type(payload, '$.final_request.top_k') IS NOT NULL AS top_k_present,
+                   json_type(payload, '$.final_request.stop_sequences') IS NOT NULL AS stop_sequences_present,
+                   json_type(payload, '$.final_request.output_config') IS NOT NULL AS output_config_present,
+                   json_array_length(json_extract(payload, '$.final_request.tools')) AS tools_count,
+                   json_array_length(json_extract(payload, '$.final_request.messages')) AS raw_msg_count,
+                   CASE
+                       WHEN json_type(payload, '$.original_request') IS NULL THEN 0
+                       WHEN json_type(payload, '$.final_request') IS NULL THEN 1
+                       ELSE json_extract(payload, '$.original_request') <> json_extract(payload, '$.final_request')
+                   END AS request_was_modified
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id IN ({placeholders}) AND event_type = 'transaction.request_recorded'
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            *(call_range.call_id for call_range in ranges),
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT call_id,
+                   MIN(created_at) OVER (PARTITION BY call_id) AS first_ts,
+                   created_at AS request_ts,
+                   payload->>'final_model' AS final_model,
+                   payload->'final_request'->>'model' AS model,
+                   (payload->'final_request'->>'max_tokens')::integer AS max_tokens,
+                   (payload->'final_request'->>'stream')::boolean AS stream,
+                   (payload->'final_request'->>'temperature')::double precision AS temperature,
+                   (payload->'final_request'->>'top_p')::double precision AS top_p,
+                   (payload->'final_request'->>'top_k')::integer AS top_k,
+                   payload->'final_request'->'stop_sequences' AS stop_sequences,
+                   payload->'final_request'->'output_config' AS output_config,
+                   payload->'final_request' ? 'model' AS model_present,
+                   payload->'final_request' ? 'max_tokens' AS max_tokens_present,
+                   payload->'final_request' ? 'stream' AS stream_present,
+                   payload->'final_request' ? 'temperature' AS temperature_present,
+                   payload->'final_request' ? 'top_p' AS top_p_present,
+                   payload->'final_request' ? 'top_k' AS top_k_present,
+                   payload->'final_request' ? 'stop_sequences' AS stop_sequences_present,
+                   payload->'final_request' ? 'output_config' AS output_config_present,
+                   jsonb_array_length(COALESCE(payload->'final_request'->'tools', '[]'::jsonb)) AS tools_count,
+                   jsonb_array_length(payload->'final_request'->'messages') AS raw_msg_count,
+                   (payload->'original_request') IS NOT NULL
+                       AND (payload->'original_request') <> (payload->'final_request') AS request_was_modified
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id = ANY($2) AND event_type = 'transaction.request_recorded'
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            [call_range.call_id for call_range in ranges],
+        )
+
+    range_by_call_id = {call_range.call_id: call_range for call_range in ranges}
+    projection_by_call_id: dict[str, RequestProjection] = {}
+    for row in rows:
+        call_id = str(row["call_id"])
+        call_range = range_by_call_id.get(call_id)
+        if call_range is None or parse_db_ts(row["request_ts"]) > call_range.last_ts:
+            continue
+        row_values = dict(row)
+        row_values["first_ts"] = call_range.first_ts
+        projection_by_call_id.setdefault(call_id, _projection_from_row(row_values))
+    return [
+        projection_by_call_id[call_range.call_id]
+        for call_range in ranges
+        if call_range.call_id in projection_by_call_id
+    ]
+
+
+async def _fetch_request_messages_by_call_id(
+    conn: Any, session_id: str, call_ids: Sequence[str], *, is_sqlite: bool
+) -> dict[str, list[dict[str, Any]]]:
+    if not call_ids:
+        return {}
+    if is_sqlite:
+        placeholders = ", ".join(f"${index}" for index in range(2, len(call_ids) + 2))
+        rows = await conn.fetch(
+            f"""
+            SELECT call_id, json_extract(payload, '$.final_request.messages') AS messages
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id IN ({placeholders}) AND event_type = 'transaction.request_recorded'
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            *call_ids,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT call_id, payload->'final_request'->'messages' AS messages
+            FROM conversation_events
+            WHERE session_id = $1 AND call_id = ANY($2) AND event_type = 'transaction.request_recorded'
+            ORDER BY call_id, created_at ASC
+            """,
+            session_id,
+            list(call_ids),
+        )
+    messages_by_call_id: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        call_id = str(row["call_id"])
+        messages_by_call_id.setdefault(call_id, _json_list(row["messages"]))
+    return messages_by_call_id
+
+
 async def _fetch_call_ranges(session_id: str, db_pool: DatabasePool) -> list[CallEventRange]:
     async with db_pool.connection() as conn:
         rows = await conn.fetch(
@@ -1401,6 +1730,38 @@ async def iter_session_turns(
     """Yield conversation turns with request messages reduced to transcript deltas."""
     if ranges is None:
         ranges = await _fetch_call_ranges(session_id, db_pool)
+    is_sqlite = db_pool.is_sqlite is True
+    async with db_pool.connection() as conn:
+        async with conn.transaction():
+            projections = await _fetch_request_projections(conn, session_id, ranges, is_sqlite=is_sqlite)
+            plan = _select_fast_path_anchor(projections)
+            if plan is not None and len(projections) == len(ranges):
+                messages_by_call_id = await _fetch_request_messages_by_call_id(
+                    conn,
+                    session_id,
+                    [plan.anchor.call_id, *(projection.call_id for projection in plan.preflights)],
+                    is_sqlite=is_sqlite,
+                )
+                event_rows_by_call_id = await _fetch_non_request_event_rows(
+                    conn,
+                    session_id,
+                    ranges,
+                    is_sqlite=is_sqlite,
+                )
+                events_by_call_id = {
+                    call_id: _stored_events_from_rows(rows) for call_id, rows in event_rows_by_call_id.items()
+                }
+                async for turn in _iter_session_turns_fast(projections, events_by_call_id, messages_by_call_id):
+                    yield turn
+                return
+
+    async for turn in _iter_session_turns_slow(session_id, db_pool, ranges):
+        yield turn
+
+
+async def _iter_session_turns_slow(
+    session_id: str, db_pool: DatabasePool, ranges: list[CallEventRange]
+) -> AsyncIterator[ConversationTurn]:
     delta_state = RequestDeltaState()
     async with db_pool.connection() as conn:
         async with conn.transaction():
@@ -1521,18 +1882,26 @@ async def stream_session_jsonl(session_id: str, db_pool: DatabasePool) -> AsyncI
         yield json.dumps(record, default=str) + "\n"
 
 
-_REQUEST_PARAM_ALLOWLIST = frozenset(
-    {
-        "model",
-        "max_tokens",
-        "stream",
-        "temperature",
-        "top_p",
-        "top_k",
-        "stop_sequences",
-        "output_config",
-    }
+_REQUEST_PARAM_ALLOWLIST = (
+    "model",
+    "max_tokens",
+    "stream",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+    "output_config",
 )
+_REQUEST_PARAM_NORMALIZERS = {
+    "model": _raw_request_param,
+    "max_tokens": _raw_request_param,
+    "stream": _bool_request_param,
+    "temperature": _raw_request_param,
+    "top_p": _raw_request_param,
+    "top_k": _raw_request_param,
+    "stop_sequences": _json_list_request_param,
+    "output_config": _output_config_request_param,
+}
 
 
 def _build_turn(call_id: str, events: list[StoredEvent]) -> ConversationTurn:
