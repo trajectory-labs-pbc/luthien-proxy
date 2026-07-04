@@ -11,6 +11,7 @@ import secrets
 from collections.abc import MutableMapping
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
@@ -40,6 +41,7 @@ from luthien_proxy.observability.event_publisher import (
 )
 from luthien_proxy.observability.redis_event_publisher import RedisEventPublisher
 from luthien_proxy.observability.sentry import init_sentry
+from luthien_proxy.passthrough_routes import router as passthrough_router
 from luthien_proxy.pipeline.upstream_headers import validate_upstream_headers_at_startup
 from luthien_proxy.policy_manager import PolicyManager
 from luthien_proxy.rate_limit import TokenBucketRateLimiter
@@ -278,6 +280,11 @@ def create_app(
         if _enable_request_logging:
             logger.info("Request/response logging ENABLED")
 
+        _passthrough_streaming_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=30.0)
+        )
+        _passthrough_buffered_client = httpx.AsyncClient(timeout=120.0)
+
         # Initialize usage telemetry
         settings = get_settings()
         _telemetry_config = await resolve_telemetry_config(
@@ -381,6 +388,8 @@ def create_app(
             config_registry=_config_registry,
             rate_limiter=_rate_limiter,
             webhook_sender=_webhook_sender,
+            passthrough_streaming_client=_passthrough_streaming_client,
+            passthrough_buffered_client=_passthrough_buffered_client,
         )
 
         # Store dependencies container in app state
@@ -403,6 +412,8 @@ def create_app(
             await _purger.stop()
         if _telemetry_sender is not None:
             await _telemetry_sender.stop()
+        await _passthrough_streaming_client.aclose()
+        await _passthrough_buffered_client.aclose()
         await _inference_provider_registry.close()
         await _credential_manager.close()
         await anthropic_client_cache.close_all()
@@ -464,6 +475,7 @@ def create_app(
 
     # Include routers
     app.include_router(gateway_router)  # /v1/messages
+    app.include_router(passthrough_router)  # /openai/* and /gemini/*
     app.include_router(debug_router)  # /api/debug/*
     app.include_router(ui_router)  # /activity/*, /policy-config, /diffs
     app.include_router(admin_router)  # /api/admin/* (policy management)

@@ -24,8 +24,8 @@ from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
 
 logger = logging.getLogger(__name__)
 
-# Bodies larger than this are replaced with a truncation notice
-MAX_BODY_BYTES = 1_048_576  # 1 MB
+# Agentic multi-provider captures can exceed 1 MB; keep full bodies for transcript replay.
+MAX_BODY_BYTES = 8_388_608  # 8 MB
 
 
 def _log_task_exception(task: asyncio.Task[None]) -> None:
@@ -243,8 +243,16 @@ class RequestLogRecorder:
         """Insert both inbound and outbound rows."""
         try:
             async with self._db_pool.connection() as conn:
+                cache: dict[int, str | None] = {}
+
+                def serialize_body(body: dict[str, Any] | None) -> str | None:
+                    key = id(body)
+                    if key not in cache:
+                        cache[key] = self._serialize_body(body)
+                    return cache[key]
+
                 for pending in (self._inbound, self._outbound):
-                    await _insert_log_row(conn, pending, self._serialize_body)
+                    await _insert_log_row(conn, pending, serialize_body)
         except DatabaseWriteError as exc:
             RequestLogRecorder.dropped_writes += 1
             logger.warning(

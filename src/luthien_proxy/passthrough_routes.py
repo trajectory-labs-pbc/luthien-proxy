@@ -1,0 +1,276 @@
+"""OpenAI and Gemini passthrough routes with full request_log body capture."""
+
+from __future__ import annotations
+
+import os
+import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
+
+import httpx
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from luthien_proxy.dependencies import get_dependencies
+from luthien_proxy.passthrough_capture import (
+    _RESPONSE_STRIPPED_HEADERS,
+    JsonObject,
+    build_passthrough_headers,
+    json_loads,
+    parse_gemini_model,
+    parse_openai_model,
+    reassemble_gemini_json_array_stream,
+    reassemble_gemini_sse_stream,
+    reassemble_openai_sse_stream,
+)
+from luthien_proxy.request_log.recorder import RequestLogRecorder, create_recorder
+from luthien_proxy.request_log.sanitize import sanitize_url
+
+Provider = Literal["openai", "gemini"]
+
+router = APIRouter(tags=["passthrough"])
+
+_OPENAI_BASE_URL = "https://api.openai.com"
+_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
+
+
+@dataclass(frozen=True, slots=True)
+class _UpstreamTarget:
+    provider: Provider
+    path: str
+    base_url: str
+    is_streaming: bool
+
+    @property
+    def endpoint(self) -> str:
+        return f"/{self.provider}/{self.path}"
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestPayload:
+    body_bytes: bytes
+    body: JsonObject
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamContext:
+    request: Request
+    client: httpx.AsyncClient
+    target: _UpstreamTarget
+    upstream_url: str
+    forwarded_headers: dict[str, str]
+    payload: _RequestPayload
+    recorder: RequestLogRecorder
+
+
+async def _json_body(request: Request) -> _RequestPayload:
+    body_bytes = await request.body()
+    if not body_bytes:
+        return _RequestPayload(body_bytes=body_bytes, body={})
+    parsed = json_loads(body_bytes)
+    if isinstance(parsed, dict):
+        return _RequestPayload(body_bytes=body_bytes, body=parsed)
+    return _RequestPayload(body_bytes=body_bytes, body={"body": parsed})
+
+
+def _target_url(target: _UpstreamTarget, request: Request) -> str:
+    base = urlsplit(target.base_url.rstrip("/"))
+    path = f"/{target.path}"
+    return urlunsplit((base.scheme, base.netloc, path, request.url.query, ""))
+
+
+def _is_openai_stream(path: str, body: JsonObject) -> bool:
+    stream = body.get("stream")
+    return stream is True or path.endswith("/stream")
+
+
+def _is_gemini_stream(path: str, request: Request) -> bool:
+    return "streamGenerateContent" in path or request.query_params.get("alt") == "sse"
+
+
+def _response_body(response_bytes: bytes) -> JsonObject:
+    if not response_bytes:
+        return {}
+    try:
+        parsed = json_loads(response_bytes)
+    except ValueError:
+        return {"body_text": response_bytes.decode(errors="replace")}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"body": parsed}
+
+
+def _stream_body(provider: Provider, request: Request, chunks: list[bytes]) -> JsonObject:
+    match provider:
+        case "openai":
+            return reassemble_openai_sse_stream(chunks)
+        case "gemini":
+            if request.query_params.get("alt") == "sse":
+                return reassemble_gemini_sse_stream(chunks)
+            return reassemble_gemini_json_array_stream(chunks)
+
+
+def _client_response_headers(headers: httpx.Headers | dict[str, str]) -> dict[str, str]:
+    return {key: value for key, value in headers.items() if key.lower() not in _RESPONSE_STRIPPED_HEADERS}
+
+
+def _request_error_text(error: httpx.RequestError, upstream_url: str, forwarded_headers: dict[str, str]) -> str:
+    text = f"{type(error).__name__}: {error!s}"
+    text = text.replace(upstream_url, sanitize_url(upstream_url))
+    for value in forwarded_headers.values():
+        if value:
+            text = text.replace(value, "[REDACTED]")
+    return text
+
+
+def _upstream_error_response(
+    recorder: RequestLogRecorder,
+    error: httpx.RequestError,
+    upstream_url: str,
+    forwarded_headers: dict[str, str],
+) -> JSONResponse:
+    error_text = _request_error_text(error, upstream_url, forwarded_headers)
+    recorder.record_inbound_response(status=502, error=error_text)
+    recorder.record_outbound_response(status=502, error=error_text)
+    recorder.flush()
+    return JSONResponse(status_code=502, content={"error": "upstream request failed"})
+
+
+async def _passthrough(request: Request, target: _UpstreamTarget, payload: _RequestPayload) -> Response:
+    deps = get_dependencies(request)
+    recorder = create_recorder(deps.db_pool, str(uuid.uuid4()), deps.enable_request_logging)
+    upstream_url = _target_url(target, request)
+    forwarded_headers = build_passthrough_headers(request.headers.items())
+    model = (
+        parse_openai_model(payload.body, request.headers.get("x-luthien-model"))
+        if target.provider == "openai"
+        else parse_gemini_model(target.path, payload.body, request.headers.get("x-luthien-model"))
+    )
+    session_id = request.headers.get("x-session-id") or request.headers.get("x-luthien-session-id")
+    recorder.record_inbound_request(
+        method=request.method,
+        url=sanitize_url(str(request.url)),
+        headers=dict(request.headers),
+        body=payload.body,
+        session_id=session_id,
+        model=model,
+        endpoint=target.endpoint,
+        is_streaming=target.is_streaming,
+    )
+    recorder.record_outbound_request(
+        method=request.method,
+        url=sanitize_url(upstream_url),
+        body=payload.body,
+        model=model,
+        endpoint=target.endpoint,
+        is_streaming=target.is_streaming,
+    )
+    client = deps.passthrough_streaming_client if target.is_streaming else deps.passthrough_buffered_client
+    if client is None:
+        return Response(status_code=503, content=b"passthrough client not initialized")
+    if target.is_streaming:
+        return await _streaming_passthrough(
+            _StreamContext(
+                request=request,
+                client=client,
+                target=target,
+                upstream_url=upstream_url,
+                forwarded_headers=forwarded_headers,
+                payload=payload,
+                recorder=recorder,
+            )
+        )
+    try:
+        upstream = await client.request(
+            request.method, upstream_url, headers=forwarded_headers, content=payload.body_bytes
+        )
+    except httpx.RequestError as exc:
+        return _upstream_error_response(recorder, exc, upstream_url, forwarded_headers)
+    body = _response_body(upstream.content)
+    recorder.record_inbound_response(status=upstream.status_code, body=body, headers=dict(upstream.headers))
+    recorder.record_outbound_response(status=upstream.status_code, body=body)
+    recorder.flush()
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=_client_response_headers(upstream.headers),
+    )
+
+
+async def _streaming_passthrough(context: _StreamContext) -> Response:
+    upstream_request = context.client.build_request(
+        context.request.method,
+        context.upstream_url,
+        headers=context.forwarded_headers,
+        content=context.payload.body_bytes,
+    )
+    try:
+        upstream = await context.client.send(upstream_request, stream=True)
+    except httpx.RequestError as exc:
+        return _upstream_error_response(context.recorder, exc, context.upstream_url, context.forwarded_headers)
+    if upstream.status_code >= 400:
+        body_bytes = await upstream.aread()
+        await upstream.aclose()
+        body = _response_body(body_bytes)
+        context.recorder.record_inbound_response(status=upstream.status_code, body=body, headers=dict(upstream.headers))
+        context.recorder.record_outbound_response(status=upstream.status_code, body=body)
+        context.recorder.flush()
+        return Response(
+            content=body_bytes,
+            status_code=upstream.status_code,
+            headers=_client_response_headers(upstream.headers),
+        )
+
+    async def stream() -> AsyncIterator[bytes]:
+        chunks: list[bytes] = []
+        try:
+            async for chunk in upstream.aiter_bytes():
+                chunks.append(chunk)
+                yield chunk
+        finally:
+            await upstream.aclose()
+            body = _stream_body(context.target.provider, context.request, chunks)
+            context.recorder.record_inbound_response(
+                status=upstream.status_code, body=body, headers=dict(upstream.headers)
+            )
+            context.recorder.record_outbound_response(status=upstream.status_code, body=body)
+            context.recorder.flush()
+
+    return StreamingResponse(
+        stream(), status_code=upstream.status_code, headers=_client_response_headers(upstream.headers)
+    )
+
+
+@router.api_route("/openai/{path:path}", methods=["GET", "POST"])
+async def openai_passthrough(request: Request, path: str) -> Response:
+    payload = await _json_body(request)
+    return await _passthrough(
+        request,
+        _UpstreamTarget(
+            provider="openai",
+            path=path,
+            base_url=os.getenv("OPENAI_BASE_URL", _OPENAI_BASE_URL),
+            is_streaming=_is_openai_stream(path, payload.body),
+        ),
+        payload,
+    )
+
+
+@router.api_route("/gemini/{path:path}", methods=["GET", "POST"])
+async def gemini_passthrough(request: Request, path: str) -> Response:
+    payload = await _json_body(request)
+    return await _passthrough(
+        request,
+        _UpstreamTarget(
+            provider="gemini",
+            path=path,
+            base_url=os.getenv("GEMINI_BASE_URL", _GEMINI_BASE_URL),
+            is_streaming=_is_gemini_stream(path, request),
+        ),
+        payload,
+    )
+
+
+__all__ = ["router"]
