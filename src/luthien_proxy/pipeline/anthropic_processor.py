@@ -34,7 +34,7 @@ from anthropic.lib.streaming import MessageStreamEvent
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.context import get_current
 from opentelemetry.trace import Span
 
@@ -94,6 +94,12 @@ class _StreamErrorEvent(TypedDict):
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+meter = metrics.get_meter(__name__)
+stream_first_event_histogram = meter.create_histogram(
+    "luthien.stream.first_event_ms",
+    unit="ms",
+    description="Time to first streamed event",
+)
 
 
 # --- Streaming keepalive ------------------------------------------------------
@@ -830,6 +836,13 @@ async def _handle_execution_streaming(
                                     "not full response objects."
                                 )
                             io.ensure_request_recorded()
+                            if not emitted_any:
+                                first_event_ms = int((time.monotonic() - request_start_time) * 1000)
+                                response_span.set_attribute(
+                                    "luthien.stream.first_event_ms",
+                                    first_event_ms,
+                                )
+                                stream_first_event_histogram.record(first_event_ms)
                             emitted_any = True
                             cast_emitted = cast(MessageStreamEvent, emitted)
                             accumulated_events.append(cast_emitted)
