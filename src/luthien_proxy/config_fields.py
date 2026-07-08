@@ -205,6 +205,11 @@ CONFIG_FIELDS: tuple[ConfigFieldMeta, ...] = (
         category="observability",
     ),
     ConfigFieldMeta(
+        "otel_exporter_otlp_metrics_endpoint", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", str, "http://tempo:4318/v1/metrics",
+        "OTLP exporter endpoint for metrics (default targets the HTTP/protobuf receiver on tempo:4318)",
+        category="observability",
+    ),
+    ConfigFieldMeta(
         "otel_exporter_otlp_protocol", "OTEL_EXPORTER_OTLP_PROTOCOL", str, "http/protobuf",
         "OTLP exporter protocol: 'http/protobuf' (default) or 'grpc'",
         category="observability",

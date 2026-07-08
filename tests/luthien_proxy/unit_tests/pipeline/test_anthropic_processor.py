@@ -25,7 +25,11 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from httpx import Request as HttpxRequest
 from httpx import Response as HttpxResponse
+from opentelemetry import metrics
 from opentelemetry import trace
+import opentelemetry.metrics._internal as metrics_internal
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -52,6 +56,17 @@ from luthien_proxy.policy_core.anthropic_execution_interface import (
 from luthien_proxy.policy_core.policy_context import PolicyContext
 
 
+def _metric_point(reader: InMemoryMetricReader, metric_name: str):
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    return metric.data.data_points[0]
+    raise AssertionError(f"metric {metric_name!r} was not recorded")
+
+
 @pytest.fixture
 def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
     previous_provider = trace._TRACER_PROVIDER
@@ -74,6 +89,24 @@ def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExpor
         provider.shutdown()
         trace._TRACER_PROVIDER = previous_provider
         trace._TRACER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class TestFormatSSEEvent:
@@ -2258,6 +2291,34 @@ class TestStreamingWebhookGate:
         assert attrs is not None
         assert isinstance(attrs["luthien.stream.first_event_ms"], int)
         assert attrs["luthien.stream.first_event_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_first_stream_event_records_histogram(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ):
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        async def emissions():
+            yield self._make_event()
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-first-event-metric",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            request_start_time=time.monotonic() - 0.01,
+        )
+
+        await self._drain(response)
+
+        point = _metric_point(metric_reader, "luthien.stream.first_event_ms")
+        assert point.count == 1
+        assert point.sum >= 0
 
     @pytest.mark.asyncio
     async def test_mid_stream_exception_fires_with_success_false(self):
