@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.trace import Status, StatusCode
 
 from luthien_proxy.request_log.sanitize import sanitize_headers
@@ -27,6 +27,17 @@ from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+meter = metrics.get_meter(__name__)
+db_request_log_dropped_counter = meter.create_counter(
+    "luthien.db.request_log.dropped",
+    unit="1",
+    description="Count of dropped DB request-log writes",
+)
+db_write_duration_histogram = meter.create_histogram(
+    "luthien.db.write.duration_ms",
+    unit="ms",
+    description="Duration of DB request-log writes",
+)
 
 # Bodies larger than this are replaced with a truncation notice
 MAX_BODY_BYTES = 1_048_576  # 1 MB
@@ -286,6 +297,7 @@ class RequestLogRecorder:
             except DatabaseWriteError as exc:
                 span.set_status(Status(StatusCode.ERROR, "db write failed"))
                 RequestLogRecorder.dropped_writes += 1
+                db_request_log_dropped_counter.add(1)
                 logger.warning(
                     "Failed to write request logs for %s (%d total dropped): %s",
                     self._transaction_id,
@@ -293,7 +305,9 @@ class RequestLogRecorder:
                     exc.cause,
                 )
             finally:
-                span.set_attribute("db.write.duration_ms", int((time.monotonic() - write_started_at) * 1000))
+                duration_ms = int((time.monotonic() - write_started_at) * 1000)
+                span.set_attribute("db.write.duration_ms", duration_ms)
+                db_write_duration_histogram.record(duration_ms)
                 span.set_attribute("luthien.request_log.request_body_bytes", request_body_bytes)
                 span.set_attribute("luthien.request_log.response_body_bytes", response_body_bytes)
                 span.set_attribute("luthien.request_log.body_truncated", body_truncated)

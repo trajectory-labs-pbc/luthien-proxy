@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
 import asyncpg
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.trace import Status, StatusCode
 
 from luthien_proxy.observability.event_publisher import EventPublisherProtocol
@@ -72,6 +72,17 @@ def _safe_serialize(obj: Any) -> Any:
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+meter = metrics.get_meter(__name__)
+db_event_write_dropped_counter = meter.create_counter(
+    "luthien.db.event_write.dropped",
+    unit="1",
+    description="Count of dropped DB event writes",
+)
+db_write_duration_histogram = meter.create_histogram(
+    "luthien.db.write.duration_ms",
+    unit="ms",
+    description="Duration of DB event writes",
+)
 
 
 def _log_task_exception(task: asyncio.Task[None]) -> None:
@@ -312,12 +323,15 @@ class EventEmitter:
             except (OSError, asyncpg.PostgresError, asyncpg.InternalClientError, sqlite3.Error) as e:
                 span.set_status(Status(StatusCode.ERROR, "db write failed"))
                 EventEmitter.dropped_db_writes += 1
+                db_event_write_dropped_counter.add(1)
                 logger.warning(
                     f"Failed to write event to database ({EventEmitter.dropped_db_writes} total dropped): {repr(e)}",
                     exc_info=True,
                 )
             finally:
-                span.set_attribute("db.write.duration_ms", int((time.monotonic() - write_started_at) * 1000))
+                duration_ms = int((time.monotonic() - write_started_at) * 1000)
+                span.set_attribute("db.write.duration_ms", duration_ms)
+                db_write_duration_histogram.record(duration_ms)
 
     async def _write_events(
         self,
