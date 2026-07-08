@@ -22,11 +22,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import asyncpg
 import pytest
+from opentelemetry import metrics
 from opentelemetry import trace
-from opentelemetry.trace import StatusCode
+import opentelemetry.metrics._internal as metrics_internal
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 from luthien_proxy.request_log import recorder as recorder_mod
 from luthien_proxy.request_log.recorder import (
@@ -39,6 +43,17 @@ from luthien_proxy.request_log.recorder import (
     create_recorder,
 )
 from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
+
+
+def _metric_point(reader: InMemoryMetricReader, metric_name: str):
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    return metric.data.data_points[0]
+    raise AssertionError(f"metric {metric_name!r} was not recorded")
 
 
 @pytest.fixture
@@ -59,6 +74,24 @@ def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExpor
         provider.shutdown()
         trace._TRACER_PROVIDER = previous_provider
         trace._TRACER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class Test_PendingLog:
@@ -561,6 +594,27 @@ class TestRequestLogRecorder:
         assert RequestLogRecorder.dropped_writes == before + 1
 
     @pytest.mark.asyncio
+    async def test_write_logs_increments_dropped_metric_once_per_failed_flush(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ) -> None:
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
+
+        db_pool = MagicMock(spec=DatabasePool)
+        db_pool.connection = MagicMock()
+        db_pool.connection.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        db_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        recorder = RequestLogRecorder(db_pool, "txn-123")
+        recorder.record_inbound_request(method="POST", url="http://example.com", headers={}, body={})
+
+        await recorder._write_logs()
+
+        point = _metric_point(metric_reader, "luthien.db.request_log.dropped")
+        assert point.value == 1
+
+    @pytest.mark.asyncio
     async def test_write_logs_wraps_any_exception_as_write_failure(self) -> None:
         """Any exception from the DB call is treated as a write failure and caught."""
         mock_conn = AsyncMock()
@@ -647,6 +701,29 @@ class TestRequestLogRecorder:
         assert attrs["luthien.request_log.body_truncated"] is False
         assert isinstance(attrs["db.write.duration_ms"], int)
         assert attrs["db.write.duration_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_write_logs_records_duration_metric(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ) -> None:
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock()
+
+        db_pool = MagicMock(spec=DatabasePool)
+        db_pool.connection = MagicMock()
+        db_pool.connection.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        db_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        recorder = RequestLogRecorder(db_pool, "txn-123")
+        recorder.record_inbound_request(method="POST", url="http://example.com", headers={}, body={"prompt": "hello"})
+        recorder.record_inbound_response(status=200, body={"completion": "world"})
+
+        await recorder._write_logs()
+
+        point = _metric_point(metric_reader, "luthien.db.write.duration_ms")
+        assert point.count == 1
+        assert point.sum >= 0
 
     @pytest.mark.asyncio
     async def test_write_logs_marks_span_error_on_db_failure(

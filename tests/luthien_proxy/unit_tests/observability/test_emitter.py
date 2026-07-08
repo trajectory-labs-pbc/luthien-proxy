@@ -10,11 +10,15 @@ from unittest.mock import AsyncMock, patch
 
 import asyncpg
 import pytest
+from opentelemetry import metrics
 from opentelemetry import trace
-from opentelemetry.trace import StatusCode
+import opentelemetry.metrics._internal as metrics_internal
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
 
 from luthien_proxy.observability import emitter as emitter_mod
@@ -41,6 +45,17 @@ def _add_transaction_cm(mock_conn: AsyncMock) -> AsyncMock:
     return mock_conn
 
 
+def _metric_point(reader: InMemoryMetricReader, metric_name: str):
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    return metric.data.data_points[0]
+    raise AssertionError(f"metric {metric_name!r} was not recorded")
+
+
 @pytest.fixture
 def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
     previous_provider = trace._TRACER_PROVIDER
@@ -59,6 +74,24 @@ def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExpor
         provider.shutdown()
         trace._TRACER_PROVIDER = previous_provider
         trace._TRACER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class TestSafeSerialize:
@@ -302,6 +335,27 @@ class TestEventEmitter:
         assert EventEmitter.dropped_db_writes == before + 1
 
     @pytest.mark.asyncio
+    async def test_write_db_increments_dropped_metric_once_per_failed_flush(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ) -> None:
+        mock_conn = _add_transaction_cm(AsyncMock())
+        mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
+
+        @asynccontextmanager
+        async def fake_connection():
+            yield mock_conn
+
+        mock_pool = AsyncMock()
+        mock_pool.connection = fake_connection
+        emitter = EventEmitter(db_pool=mock_pool, stdout_enabled=False)
+
+        await emitter._write_db("tx-123", "test.event", {"body": "secret"}, datetime.now(UTC))
+
+        point = _metric_point(metric_reader, "luthien.db.event_write.dropped")
+        assert point.value == 1
+
+    @pytest.mark.asyncio
     async def test_write_db_increments_dropped_counter_on_os_error(self) -> None:
         """_write_db() increments dropped_db_writes on OSError."""
         mock_conn = _add_transaction_cm(AsyncMock())
@@ -343,6 +397,27 @@ class TestEventEmitter:
         assert isinstance(attrs["db.write.duration_ms"], int)
         assert attrs["db.write.duration_ms"] >= 0
         assert "body" not in attrs
+
+    @pytest.mark.asyncio
+    async def test_write_db_records_duration_metric(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ) -> None:
+        mock_conn = _add_transaction_cm(AsyncMock())
+
+        @asynccontextmanager
+        async def fake_connection():
+            yield mock_conn
+
+        mock_pool = AsyncMock()
+        mock_pool.connection = fake_connection
+        emitter = EventEmitter(db_pool=mock_pool, stdout_enabled=False)
+
+        await emitter._write_db("tx-123", "test.event", {"body": "secret"}, datetime.now(UTC))
+
+        point = _metric_point(metric_reader, "luthien.db.write.duration_ms")
+        assert point.count == 1
+        assert point.sum >= 0
 
     @pytest.mark.asyncio
     async def test_write_db_marks_span_error_on_db_failure(

@@ -51,6 +51,7 @@ from luthien_proxy.session import router as session_router
 from luthien_proxy.settings import Settings, clear_settings_cache, get_settings
 from luthien_proxy.telemetry import (
     configure_logging,
+    configure_metrics,
     configure_tracing,
     instrument_app,
     instrument_redis,
@@ -74,6 +75,7 @@ from luthien_proxy.webhook.sender import WebhookSender
 # Configure OpenTelemetry tracing and logging EARLY (before app creation)
 # This ensures the tracer provider is set up before any spans are created
 configure_tracing()
+configure_metrics()
 configure_logging()
 instrument_redis()
 
