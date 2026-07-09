@@ -128,8 +128,18 @@ def passthrough_gateway_with_unreachable_openai(mock_gemini: _ProviderServer) ->
         yield url
 
 
+@pytest.fixture
+def passthrough_gateway_disabled(mock_openai: _ProviderServer, mock_gemini: _ProviderServer) -> Iterator[str]:
+    with _boot_gateway(
+        openai_url=f"http://127.0.0.1:{mock_openai.port}",
+        gemini_url=f"http://127.0.0.1:{mock_gemini.port}",
+        passthrough_enabled=False,
+    ) as url:
+        yield url
+
+
 @contextmanager
-def _boot_gateway(*, openai_url: str, gemini_url: str) -> Iterator[str]:
+def _boot_gateway(*, openai_url: str, gemini_url: str, passthrough_enabled: bool = True) -> Iterator[str]:
     port = _free_port()
     with ExitStack() as stack:
         tmp_dir = tempfile.mkdtemp(prefix="luthien_passthrough_e2e_")
@@ -139,7 +149,13 @@ def _boot_gateway(*, openai_url: str, gemini_url: str) -> Iterator[str]:
         db_pool = DatabasePool(f"sqlite:///{os.path.join(tmp_dir, 'test.db')}")
         stack.callback(lambda: loop.run_until_complete(db_pool.close()))
         loop.run_until_complete(check_migrations(db_pool))
-        env_keys = ("OPENAI_BASE_URL", "GEMINI_BASE_URL", "ANTHROPIC_API_KEY", "ENABLE_REQUEST_LOGGING")
+        env_keys = (
+            "OPENAI_BASE_URL",
+            "GEMINI_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ENABLE_REQUEST_LOGGING",
+            "PASSTHROUGH_ROUTES_ENABLED",
+        )
         old_env = {key: os.environ.get(key) for key in env_keys}
         stack.callback(lambda: _restore_env(old_env))
         stack.callback(clear_settings_cache)
@@ -147,6 +163,7 @@ def _boot_gateway(*, openai_url: str, gemini_url: str) -> Iterator[str]:
         os.environ["GEMINI_BASE_URL"] = gemini_url
         os.environ["ANTHROPIC_API_KEY"] = "mock-key"
         os.environ["ENABLE_REQUEST_LOGGING"] = "true"
+        os.environ["PASSTHROUGH_ROUTES_ENABLED"] = "true" if passthrough_enabled else "false"
         clear_settings_cache()
         app = create_app(
             api_key=_API_KEY,
@@ -304,3 +321,30 @@ async def test_openai_passthrough_persists_request_body_and_error_when_upstream_
     assert inbound["response_status"] == 502
     assert inbound["error"] is not None
     assert all(secret not in str(inbound) for secret in _ERROR_SECRETS)
+
+
+@pytest.mark.asyncio
+async def test_passthrough_routes_404_when_feature_disabled(
+    passthrough_gateway_disabled: str,
+    mock_openai: _ProviderServer,
+    mock_gemini: _ProviderServer,
+) -> None:
+    # Given the passthrough feature is disabled (the default)
+    requests_before = (len(mock_openai.requests), len(mock_gemini.requests))
+
+    # When both routes are hit
+    async with _client() as client:
+        openai_response = await client.post(
+            f"{passthrough_gateway_disabled}/openai/v1/responses",
+            json={"model": "gpt-4.1", "input": "should not reach upstream"},
+            headers={"Authorization": "Bearer client-openai-secret"},
+        )
+        gemini_response = await client.post(
+            f"{passthrough_gateway_disabled}/gemini/v1beta/models/gemini-2.5-pro:generateContent",
+            json={"contents": [{"parts": [{"text": "hello"}]}]},
+            headers={"x-goog-api-key": "client-google-secret"},
+        )
+
+    # Then both 404 and nothing was relayed upstream
+    assert (openai_response.status_code, gemini_response.status_code) == (404, 404)
+    assert (len(mock_openai.requests), len(mock_gemini.requests)) == requests_before

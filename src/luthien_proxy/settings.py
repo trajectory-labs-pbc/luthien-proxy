@@ -90,6 +90,10 @@ class Settings(_SettingsBase):
     railway_service_name: str = ""
     enable_request_logging: bool = False
 
+    # ── passthrough ─────────────────────────────────────────────────
+    passthrough_routes_enabled: bool = False
+    passthrough_stream_capture_max_bytes: int = 10485760
+
     # ── telemetry ───────────────────────────────────────────────────
     usage_telemetry: bool | None = None
     telemetry_endpoint: str = "https://telemetry.luthien.cc/v1/events"

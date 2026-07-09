@@ -10,7 +10,7 @@ from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from luthien_proxy.dependencies import get_dependencies
@@ -27,6 +27,7 @@ from luthien_proxy.passthrough_capture import (
 )
 from luthien_proxy.request_log.recorder import RequestLogRecorder, create_recorder
 from luthien_proxy.request_log.sanitize import sanitize_url
+from luthien_proxy.settings import get_settings
 
 Provider = Literal["openai", "gemini"]
 
@@ -34,6 +35,18 @@ router = APIRouter(tags=["passthrough"])
 
 _OPENAI_BASE_URL = "https://api.openai.com"
 _GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
+
+
+async def _require_passthrough_enabled() -> None:
+    """Gate the passthrough routes behind PASSTHROUGH_ROUTES_ENABLED (default off).
+
+    These routes forward client-supplied upstream credentials, so an always-on
+    deployment would act as an open relay and let anyone with network reach write
+    request_logs. When disabled we 404 so the routes are indistinguishable from
+    unmounted paths.
+    """
+    if not get_settings().passthrough_routes_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,13 +238,22 @@ async def _streaming_passthrough(context: _StreamContext) -> Response:
 
     async def stream() -> AsyncIterator[bytes]:
         chunks: list[bytes] = []
+        captured_bytes = 0
+        max_capture = get_settings().passthrough_stream_capture_max_bytes
+        truncated = False
         try:
             async for chunk in upstream.aiter_bytes():
-                chunks.append(chunk)
+                if captured_bytes < max_capture:
+                    chunks.append(chunk)
+                    captured_bytes += len(chunk)
+                    if captured_bytes >= max_capture:
+                        truncated = True
                 yield chunk
         finally:
             await upstream.aclose()
             body = _stream_body(context.target.provider, context.request, chunks)
+            if truncated:
+                body = {**body, "capture_truncated": True}
             context.recorder.record_inbound_response(
                 status=upstream.status_code, body=body, headers=dict(upstream.headers)
             )
@@ -243,7 +265,7 @@ async def _streaming_passthrough(context: _StreamContext) -> Response:
     )
 
 
-@router.api_route("/openai/{path:path}", methods=["GET", "POST"])
+@router.api_route("/openai/{path:path}", methods=["GET", "POST"], dependencies=[Depends(_require_passthrough_enabled)])
 async def openai_passthrough(request: Request, path: str) -> Response:
     payload = await _json_body(request)
     return await _passthrough(
@@ -258,7 +280,7 @@ async def openai_passthrough(request: Request, path: str) -> Response:
     )
 
 
-@router.api_route("/gemini/{path:path}", methods=["GET", "POST"])
+@router.api_route("/gemini/{path:path}", methods=["GET", "POST"], dependencies=[Depends(_require_passthrough_enabled)])
 async def gemini_passthrough(request: Request, path: str) -> Response:
     payload = await _json_body(request)
     return await _passthrough(

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
+from fastapi import HTTPException
+
 from luthien_proxy.passthrough_capture import (
     build_passthrough_headers,
     parse_gemini_model,
@@ -8,7 +13,11 @@ from luthien_proxy.passthrough_capture import (
     reassemble_gemini_sse_stream,
     reassemble_openai_sse_stream,
 )
-from luthien_proxy.passthrough_routes import _client_response_headers, _response_body
+from luthien_proxy.passthrough_routes import (
+    _client_response_headers,
+    _require_passthrough_enabled,
+    _response_body,
+)
 from luthien_proxy.request_log.sanitize import sanitize_headers, sanitize_url
 
 
@@ -141,3 +150,23 @@ def test_response_body_falls_back_to_replacement_text_for_invalid_utf8() -> None
 
     # Then
     assert body == {"body_text": "��"}
+
+
+async def test_require_passthrough_enabled_rejects_when_disabled() -> None:
+    # Given the feature flag is off (the default)
+    with patch("luthien_proxy.passthrough_routes.get_settings") as mock_settings:
+        mock_settings.return_value.passthrough_routes_enabled = False
+
+        # When / Then the gate 404s so the routes look unmounted
+        with pytest.raises(HTTPException) as exc_info:
+            await _require_passthrough_enabled()
+    assert exc_info.value.status_code == 404
+
+
+async def test_require_passthrough_enabled_allows_when_enabled() -> None:
+    # Given the feature flag is explicitly on
+    with patch("luthien_proxy.passthrough_routes.get_settings") as mock_settings:
+        mock_settings.return_value.passthrough_routes_enabled = True
+
+        # When / Then the gate permits the request (no exception)
+        assert await _require_passthrough_enabled() is None
