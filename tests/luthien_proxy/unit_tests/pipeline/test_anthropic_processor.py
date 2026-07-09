@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,9 +25,18 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from httpx import Request as HttpxRequest
 from httpx import Response as HttpxResponse
+from opentelemetry import metrics
+from opentelemetry import trace
+import opentelemetry.metrics._internal as metrics_internal
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from tests.constants import DEFAULT_TEST_MODEL
 from tests.luthien_proxy.fixtures.policy_context import make_policy_context
 
+from luthien_proxy.pipeline import anthropic_processor as anthropic_processor_mod
 from luthien_proxy.exceptions import BackendAPIError
 from luthien_proxy.llm.types.anthropic import AnthropicRequest, AnthropicResponse, build_usage
 from luthien_proxy.pipeline.anthropic_processor import (
@@ -43,6 +54,59 @@ from luthien_proxy.policy_core.anthropic_execution_interface import (
     AnthropicPolicyEmission,
 )
 from luthien_proxy.policy_core.policy_context import PolicyContext
+
+
+def _metric_point(reader: InMemoryMetricReader, metric_name: str):
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    return metric.data.data_points[0]
+    raise AssertionError(f"metric {metric_name!r} was not recorded")
+
+
+@pytest.fixture
+def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    previous_provider = trace._TRACER_PROVIDER
+    previous_once_done = trace._TRACER_PROVIDER_SET_ONCE._done
+    trace._TRACER_PROVIDER_SET_ONCE._done = False
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    monkeypatch.setattr(
+        anthropic_processor_mod,
+        "tracer",
+        provider.get_tracer(anthropic_processor_mod.__name__),
+    )
+
+    try:
+        yield exporter
+    finally:
+        provider.shutdown()
+        trace._TRACER_PROVIDER = previous_provider
+        trace._TRACER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class TestFormatSSEEvent:
@@ -2199,6 +2263,64 @@ class TestStreamingWebhookGate:
         assert kwargs["is_streaming"] is True
 
     @pytest.mark.asyncio
+    async def test_first_stream_event_sets_span_attribute(
+        self,
+        span_exporter: InMemorySpanExporter,
+    ):
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        async def emissions():
+            yield self._make_event()
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-first-event",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            request_start_time=time.monotonic() - 0.01,
+        )
+
+        await self._drain(response)
+
+        spans = {span.name: span for span in span_exporter.get_finished_spans()}
+        attrs = spans["process_response"].attributes
+        assert attrs is not None
+        assert isinstance(attrs["luthien.stream.first_event_ms"], int)
+        assert attrs["luthien.stream.first_event_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_first_stream_event_records_histogram(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ):
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        async def emissions():
+            yield self._make_event()
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-first-event-metric",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            request_start_time=time.monotonic() - 0.01,
+        )
+
+        await self._drain(response)
+
+        point = _metric_point(metric_reader, "luthien.stream.first_event_ms")
+        assert point.count == 1
+        assert point.sum >= 0
+
+    @pytest.mark.asyncio
     async def test_mid_stream_exception_fires_with_success_false(self):
         """Policy raises mid-stream → webhook fires with success=False, http_status=500."""
         from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
@@ -2736,3 +2858,78 @@ class TestWebhookFireIsolation:
 
         webhook.fire_and_forget.assert_called_once()
         recorder.flush.assert_called()  # cleanup completed despite webhook failure
+
+
+
+class TestStreamWithKeepalive:
+    """`_stream_with_keepalive` injects SSE keepalives during upstream gaps without
+    dropping or reordering real events. Regression: the Anthropic SDK drops upstream
+    `ping` events, so a long silent generation idled out at the ALB timeout."""
+
+    async def test_injects_keepalive_during_gap(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        async def source():
+            yield "A"
+            await asyncio.sleep(0.12)  # > interval -> keepalives expected in this gap
+            yield "B"
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+        reals = [x for x in out if not isinstance(x, _Keepalive)]
+        keepalives = [x for x in out if isinstance(x, _Keepalive)]
+        assert reals == ["A", "B"]  # order preserved, nothing dropped
+        assert len(keepalives) >= 1  # the gap produced at least one keepalive
+        assert out[0] == "A" and out[-1] == "B"  # keepalives sit between real events
+
+    async def test_no_keepalive_when_fast(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        async def source():
+            yield "A"
+            yield "B"
+            yield "C"
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.5)]
+        assert out == ["A", "B", "C"]
+        assert not any(isinstance(x, _Keepalive) for x in out)
+
+    async def test_empty_source_terminates(self):
+        from luthien_proxy.pipeline.anthropic_processor import _stream_with_keepalive
+
+        async def source():
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+        assert out == []
+
+    async def test_close_cancels_pending(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        cancelled = asyncio.Event()
+
+        async def source():
+            yield "A"
+            try:
+                await asyncio.sleep(10)  # long-pending item, in flight at close
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            yield "B"  # pragma: no cover - never reached
+
+        gen = _stream_with_keepalive(source(), 0.02)
+        assert await gen.__anext__() == "A"
+        nxt = await gen.__anext__()  # pending sleep in flight -> keepalive
+        assert isinstance(nxt, _Keepalive)
+        await gen.aclose()  # must cancel the pending __anext__, not hang
+        await asyncio.sleep(0.01)
+        assert cancelled.is_set()
