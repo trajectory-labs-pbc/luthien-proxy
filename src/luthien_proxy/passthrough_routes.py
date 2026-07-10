@@ -6,8 +6,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Literal
-from urllib.parse import urlsplit, urlunsplit
+from typing import Literal, assert_never
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -15,9 +14,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from luthien_proxy.dependencies import get_dependencies
 from luthien_proxy.passthrough_capture import (
-    _RESPONSE_STRIPPED_HEADERS,
     JsonObject,
     build_passthrough_headers,
+    build_upstream_url,
     json_loads,
     parse_gemini_model,
     parse_openai_model,
@@ -25,11 +24,13 @@ from luthien_proxy.passthrough_capture import (
     reassemble_gemini_sse_stream,
     reassemble_openai_sse_stream,
 )
-from luthien_proxy.request_log.recorder import RequestLogRecorder, create_recorder
+from luthien_proxy.passthrough_capture import (
+    client_response_headers as _client_response_headers,
+)
+from luthien_proxy.passthrough_recording import create_passthrough_recorder
+from luthien_proxy.request_log.recorder import RequestLogRecorder
 from luthien_proxy.request_log.sanitize import sanitize_url
 from luthien_proxy.settings import get_settings
-
-Provider = Literal["openai", "gemini"]
 
 router = APIRouter(tags=["passthrough"])
 
@@ -51,7 +52,7 @@ async def _require_passthrough_enabled() -> None:
 
 @dataclass(frozen=True, slots=True)
 class _UpstreamTarget:
-    provider: Provider
+    provider: Literal["openai", "gemini"]
     path: str
     base_url: str
     is_streaming: bool
@@ -88,12 +89,6 @@ async def _json_body(request: Request) -> _RequestPayload:
     return _RequestPayload(body_bytes=body_bytes, body={"body": parsed})
 
 
-def _target_url(target: _UpstreamTarget, request: Request) -> str:
-    base = urlsplit(target.base_url.rstrip("/"))
-    path = f"/{target.path}"
-    return urlunsplit((base.scheme, base.netloc, path, request.url.query, ""))
-
-
 def _is_openai_stream(path: str, body: JsonObject) -> bool:
     stream = body.get("stream")
     return stream is True or path.endswith("/stream")
@@ -115,7 +110,7 @@ def _response_body(response_bytes: bytes) -> JsonObject:
     return {"body": parsed}
 
 
-def _stream_body(provider: Provider, request: Request, chunks: list[bytes]) -> JsonObject:
+def _stream_body(provider: Literal["openai", "gemini"], request: Request, chunks: list[bytes]) -> JsonObject:
     match provider:
         case "openai":
             return reassemble_openai_sse_stream(chunks)
@@ -123,10 +118,8 @@ def _stream_body(provider: Provider, request: Request, chunks: list[bytes]) -> J
             if request.query_params.get("alt") == "sse":
                 return reassemble_gemini_sse_stream(chunks)
             return reassemble_gemini_json_array_stream(chunks)
-
-
-def _client_response_headers(headers: httpx.Headers | dict[str, str]) -> dict[str, str]:
-    return {key: value for key, value in headers.items() if key.lower() not in _RESPONSE_STRIPPED_HEADERS}
+        case unreachable:
+            assert_never(unreachable)
 
 
 def _request_error_text(error: httpx.RequestError, upstream_url: str, forwarded_headers: dict[str, str]) -> str:
@@ -153,21 +146,21 @@ def _upstream_error_response(
 
 async def _passthrough(request: Request, target: _UpstreamTarget, payload: _RequestPayload) -> Response:
     deps = get_dependencies(request)
-    recorder = create_recorder(deps.db_pool, str(uuid.uuid4()), deps.enable_request_logging)
-    upstream_url = _target_url(target, request)
+    recorder, session_id, user_id = create_passthrough_recorder(request.headers, str(uuid.uuid4()), deps)
+    upstream_url = build_upstream_url(target.base_url, target.path, request.url.query)
     forwarded_headers = build_passthrough_headers(request.headers.items())
     model = (
         parse_openai_model(payload.body, request.headers.get("x-luthien-model"))
         if target.provider == "openai"
         else parse_gemini_model(target.path, payload.body, request.headers.get("x-luthien-model"))
     )
-    session_id = request.headers.get("x-session-id") or request.headers.get("x-luthien-session-id")
     recorder.record_inbound_request(
         method=request.method,
         url=sanitize_url(str(request.url)),
         headers=dict(request.headers),
         body=payload.body,
         session_id=session_id,
+        user_id=user_id,
         model=model,
         endpoint=target.endpoint,
         is_streaming=target.is_streaming,

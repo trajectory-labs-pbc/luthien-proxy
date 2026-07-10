@@ -1,144 +1,233 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
-from luthien_proxy.passthrough_capture import (
-    build_passthrough_headers,
-    parse_gemini_model,
-    parse_openai_model,
-    reassemble_gemini_json_array_stream,
-    reassemble_gemini_sse_stream,
-    reassemble_openai_sse_stream,
-)
+from luthien_proxy.passthrough_capture import JsonObject
 from luthien_proxy.passthrough_routes import (
-    _client_response_headers,
+    _passthrough,
+    _RequestPayload,
     _require_passthrough_enabled,
     _response_body,
+    _UpstreamTarget,
 )
-from luthien_proxy.request_log.sanitize import sanitize_headers, sanitize_url
 
 
-def test_build_passthrough_headers_forwards_client_keys_and_strips_internal_headers() -> None:
-    # Given
-    headers = {
-        "Authorization": "Bearer client-openai-key",
-        "x-goog-api-key": "client-google-key",
-        "x-luthien-model": "gpt-4.1",
-        "Connection": "keep-alive",
-        "Host": "proxy.local",
-        "Content-Type": "application/json",
-    }
-
-    # When
-    forwarded = build_passthrough_headers(headers.items())
-
-    # Then
-    assert forwarded == {
-        "Authorization": "Bearer client-openai-key",
-        "x-goog-api-key": "client-google-key",
-        "Content-Type": "application/json",
-    }
+class _FakeDatabasePool:
+    pass
 
 
-def test_sanitize_redacts_google_api_key_header_and_key_query_param() -> None:
-    # Given
-    headers = {"x-goog-api-key": "google-secret", "x-trace-id": "trace-123"}
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent?key=google-secret&alt=sse"
+class _PassthroughDependencies:
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self.db_pool = _FakeDatabasePool()
+        self.enable_request_logging = True
+        self.passthrough_buffered_client = client
+        self.passthrough_streaming_client = client
 
-    # When
-    sanitized_headers = sanitize_headers(headers)
-    sanitized_url = sanitize_url(url)
 
-    # Then
-    assert sanitized_headers == {"x-goog-api-key": "[REDACTED]", "x-trace-id": "trace-123"}
-    assert sanitized_url == (
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent?key=%5BREDACTED%5D&alt=sse"
+class _CapturedRecorder:
+    def __init__(self) -> None:
+        self.on_commit: Callable[[str], Awaitable[None]] | None = None
+        self.user_id: str | None = None
+
+    def record_inbound_request(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: JsonObject,
+        session_id: str | None = None,
+        user_id: str | None = None,
+        model: str | None = None,
+        is_streaming: bool = False,
+        endpoint: str | None = None,
+    ) -> None:
+        self._inbound_request = (method, url, headers, body, session_id, model, is_streaming, endpoint)
+        self.user_id = user_id
+
+    def record_outbound_request(
+        self,
+        *,
+        body: JsonObject,
+        method: str = "POST",
+        url: str | None = None,
+        model: str | None = None,
+        is_streaming: bool = False,
+        endpoint: str | None = None,
+    ) -> None:
+        self._outbound_request = (body, method, url, model, is_streaming, endpoint)
+
+    def record_inbound_response(
+        self,
+        *,
+        status: int,
+        body: JsonObject | None = None,
+        headers: dict[str, str] | None = None,
+        error: str | None = None,
+    ) -> None:
+        self._inbound_response = (status, body, headers, error)
+
+    def record_outbound_response(
+        self,
+        *,
+        body: JsonObject | None = None,
+        status: int = 200,
+        error: str | None = None,
+    ) -> None:
+        self._outbound_response = (body, status, error)
+
+    def flush(self) -> None:
+        pass
+
+
+class _PassthroughSettings:
+    def __init__(self, *, materialize_enabled: bool, trust_user_id_header: bool) -> None:
+        self.passthrough_materialize_enabled = materialize_enabled
+        self.trust_user_id_header = trust_user_id_header
+
+
+def _make_passthrough_request(headers: list[tuple[bytes, bytes]]) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/openai/v1/chat/completions",
+            "raw_path": b"/openai/v1/chat/completions",
+            "query_string": b"",
+            "headers": headers,
+            "client": ("testclient", 50000),
+            "server": ("testserver", 80),
+        }
     )
-    assert "google-secret" not in sanitized_url
 
 
-def test_model_parsing_uses_body_for_openai_and_url_for_gemini() -> None:
+async def _invoke_passthrough(
+    *,
+    headers: list[tuple[bytes, bytes]],
+    materialize_enabled: bool,
+    trust_user_id_header: bool,
+    is_streaming: bool,
+) -> _CapturedRecorder:
+    recorder = _CapturedRecorder()
+
+    def capture_recorder(
+        db_pool: _FakeDatabasePool,
+        transaction_id: str,
+        enabled: bool,
+        *,
+        on_commit: Callable[[str], Awaitable[None]] | None = None,
+    ) -> _CapturedRecorder:
+        assert isinstance(db_pool, _FakeDatabasePool)
+        assert enabled
+        assert transaction_id
+        recorder.on_commit = on_commit
+        return recorder
+
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json={"id": "response"}))
+    async with httpx.AsyncClient(transport=transport) as client:
+        dependencies = _PassthroughDependencies(client)
+        with (
+            patch(
+                "luthien_proxy.passthrough_recording.get_settings",
+                return_value=_PassthroughSettings(
+                    materialize_enabled=materialize_enabled,
+                    trust_user_id_header=trust_user_id_header,
+                ),
+            ),
+            patch(
+                "luthien_proxy.passthrough_recording.create_recorder",
+                side_effect=capture_recorder,
+            ),
+            patch("luthien_proxy.passthrough_routes.get_dependencies", return_value=dependencies),
+        ):
+            await _passthrough(
+                _make_passthrough_request(headers),
+                _UpstreamTarget(
+                    provider="openai",
+                    path="v1/chat/completions",
+                    base_url="https://upstream.test",
+                    is_streaming=is_streaming,
+                ),
+                _RequestPayload(body_bytes=b'{"model":"gpt-4.1"}', body={"model": "gpt-4.1"}),
+            )
+    return recorder
+
+
+@pytest.mark.parametrize("is_streaming", [False, True])
+async def test_passthrough_wires_materialization_callback_when_enabled(is_streaming: bool) -> None:
     # Given
-    openai_body = {"model": "gpt-4.1", "input": "hello"}
-    gemini_path = "v1beta/models/gemini-2.5-pro:generateContent"
+    materialized_transaction_ids: list[str] = []
 
-    # When / Then
-    assert parse_openai_model(openai_body, override=None) == "gpt-4.1"
-    assert parse_openai_model(openai_body, override="gpt-4.1-mini") == "gpt-4.1-mini"
-    assert parse_gemini_model(gemini_path, {"model": "fallback"}, override=None) == "gemini-2.5-pro"
-    assert parse_gemini_model("v1beta/generate", {"model": "fallback"}, override=None) == "fallback"
+    async def capture_materialization(_db_pool: _FakeDatabasePool, transaction_id: str) -> None:
+        materialized_transaction_ids.append(transaction_id)
 
+    with patch(
+        "luthien_proxy.passthrough_recording.materialize_transaction",
+        new=capture_materialization,
+    ):
+        # When
+        recorder = await _invoke_passthrough(
+            headers=[],
+            materialize_enabled=True,
+            trust_user_id_header=False,
+            is_streaming=is_streaming,
+        )
 
-def test_streaming_reassembly_returns_documented_wrappers() -> None:
-    # Given
-    openai_chunks = [
-        b'data: {"id":"evt-1","output_text":"hel"}\n\n',
-        b'data: {"id":"evt-2","output_text":"hello"}\n\n',
-        b"data: [DONE]\n\n",
-    ]
-    gemini_json_chunks = [b'[{"text":"hel"},', b'{"text":"hello"}]']
-    gemini_sse_chunks = [b'data: {"text":"hel"}\n\n', b'data: {"text":"hello"}\n\n']
-
-    # When / Then
-    assert reassemble_openai_sse_stream(openai_chunks) == {
-        "stream_format": "openai-sse",
-        "events": [
-            {"id": "evt-1", "output_text": "hel"},
-            {"id": "evt-2", "output_text": "hello"},
-        ],
-        "final": {"id": "evt-2", "output_text": "hello"},
-    }
-    assert reassemble_gemini_json_array_stream(gemini_json_chunks) == {
-        "stream_format": "gemini-json-array",
-        "chunks": [{"text": "hel"}, {"text": "hello"}],
-        "final": None,
-    }
-    assert reassemble_gemini_sse_stream(gemini_sse_chunks) == {
-        "stream_format": "gemini-sse",
-        "chunks": [{"text": "hel"}, {"text": "hello"}],
-        "final": None,
-    }
+        # Then
+        assert recorder.on_commit is not None
+        await recorder.on_commit("transaction-123")
+    assert materialized_transaction_ids == ["transaction-123"]
 
 
-def test_client_response_headers_strip_encoding_length_and_hop_by_hop_headers() -> None:
-    # Given
-    upstream_headers = {
-        "content-encoding": "gzip",
-        "Content-Length": "123",
-        "Transfer-Encoding": "chunked",
-        "Connection": "keep-alive",
-        "content-type": "application/json",
-        "x-request-id": "req-123",
-    }
-
-    # When
-    returned_headers = _client_response_headers(upstream_headers)
+async def test_passthrough_omits_materialization_callback_when_disabled() -> None:
+    # Given / When
+    recorder = await _invoke_passthrough(
+        headers=[],
+        materialize_enabled=False,
+        trust_user_id_header=False,
+        is_streaming=False,
+    )
 
     # Then
-    assert returned_headers == {"content-type": "application/json", "x-request-id": "req-123"}
+    assert recorder.on_commit is None
 
 
-def test_streaming_reassembly_preserves_malformed_chunks_with_raw_fallback() -> None:
-    # Given
-    openai_chunks = [b"data: {not json}\n\n", b'data: {"ok": true}\n\n']
-    gemini_array_chunks = [b""]
+@pytest.mark.parametrize(
+    ("headers", "trust_user_id_header", "expected_user_id"),
+    [
+        ([(b"x-luthien-user-id", b"trusted-user")], True, "trusted-user"),
+        (
+            [(b"authorization", b"Bearer x.eyJzdWIiOiJqd3QtdXNlciJ9.y")],
+            False,
+            "jwt-user",
+        ),
+        ([(b"x-luthien-user-id", b"untrusted-user")], False, None),
+        ([], True, None),
+    ],
+)
+async def test_passthrough_records_user_id_from_trusted_identity(
+    headers: list[tuple[bytes, bytes]],
+    trust_user_id_header: bool,
+    expected_user_id: str | None,
+) -> None:
+    # Given / When
+    recorder = await _invoke_passthrough(
+        headers=headers,
+        materialize_enabled=False,
+        trust_user_id_header=trust_user_id_header,
+        is_streaming=False,
+    )
 
-    # When / Then
-    assert reassemble_openai_sse_stream(openai_chunks) == {
-        "stream_format": "openai-sse",
-        "events": [{"ok": True}],
-        "raw": 'data: {not json}\n\ndata: {"ok": true}\n\n',
-        "final": {"ok": True},
-    }
-    assert reassemble_gemini_json_array_stream(gemini_array_chunks) == {
-        "stream_format": "gemini-json-array",
-        "chunks": [],
-        "raw": "",
-        "final": None,
-    }
+    # Then
+    assert recorder.user_id == expected_user_id
 
 
 def test_response_body_falls_back_to_replacement_text_for_invalid_utf8() -> None:
