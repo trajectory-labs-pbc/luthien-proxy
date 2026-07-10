@@ -41,6 +41,7 @@ from luthien_proxy.observability.event_publisher import (
 )
 from luthien_proxy.observability.redis_event_publisher import RedisEventPublisher
 from luthien_proxy.observability.sentry import init_sentry
+from luthien_proxy.passthrough_materialize.worker import PassthroughReconcileWorker
 from luthien_proxy.passthrough_routes import router as passthrough_router
 from luthien_proxy.pipeline.upstream_headers import validate_upstream_headers_at_startup
 from luthien_proxy.policy_manager import PolicyManager
@@ -356,6 +357,15 @@ def create_app(
                 )
             logger.info("Conversation retention disabled (CONVERSATION_RETENTION_DAYS not set)")
 
+        _passthrough_reconcile_worker: PassthroughReconcileWorker | None = None
+        if settings.passthrough_materialize_backfill_enabled:
+            _passthrough_reconcile_worker = PassthroughReconcileWorker(
+                db_pool=db_pool,
+                limit=settings.passthrough_materialize_batch_size,
+                interval_seconds=settings.passthrough_materialize_reconcile_interval_seconds,
+            )
+            _passthrough_reconcile_worker.start()
+
         # Initialize webhook sender
         _webhook_url = settings.webhook_url or None
         _webhook_sender = WebhookSender(
@@ -408,6 +418,8 @@ def create_app(
         # before request handling has fully drained, fire_and_forget calls
         # could land against an already-closed httpx client.
         await _webhook_sender.stop()
+        if _passthrough_reconcile_worker is not None:
+            await _passthrough_reconcile_worker.stop()
         if _purger is not None:
             await _purger.stop()
         if _telemetry_sender is not None:

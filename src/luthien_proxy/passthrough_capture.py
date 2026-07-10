@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject = dict[str, JsonValue]
@@ -35,6 +36,17 @@ def build_passthrough_headers(headers: Iterable[tuple[str, str]]) -> dict[str, s
             continue
         forwarded[key] = value
     return forwarded
+
+
+def build_upstream_url(base_url: str, path: str, query: str) -> str:
+    """Build an upstream URL from the configured base URL and client request target."""
+    base = urlsplit(base_url.rstrip("/"))
+    return urlunsplit((base.scheme, base.netloc, f"/{path}", query, ""))
+
+
+def client_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Return upstream headers safe to send to the passthrough client."""
+    return {key: value for key, value in headers.items() if key.lower() not in _RESPONSE_STRIPPED_HEADERS}
 
 
 def parse_openai_model(body: Mapping[str, JsonValue], override: str | None) -> str | None:
@@ -129,6 +141,8 @@ __all__ = [
     "JsonObject",
     "JsonValue",
     "build_passthrough_headers",
+    "build_upstream_url",
+    "client_response_headers",
     "json_loads",
     "parse_gemini_model",
     "parse_openai_model",
