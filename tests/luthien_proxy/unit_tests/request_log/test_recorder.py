@@ -15,8 +15,10 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -38,10 +40,9 @@ from luthien_proxy.request_log.recorder import (
     NoOpRequestLogRecorder,
     RequestLogRecorder,
     _SerializedBody,
-    _insert_log_row,
-    _PendingLog,
     create_recorder,
 )
+from luthien_proxy.request_log.models import _PendingLog, insert_log_row
 from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
 
 
@@ -92,6 +93,15 @@ def metric_reader() -> Iterator[InMemoryMetricReader]:
         provider.shutdown()
         metrics_internal._METER_PROVIDER = previous_provider
         metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+def _make_transactional_connection() -> MagicMock:
+    connection = MagicMock()
+    transaction = MagicMock()
+    transaction.__aenter__ = AsyncMock(return_value=None)
+    transaction.__aexit__ = AsyncMock(return_value=None)
+    connection.transaction = MagicMock(return_value=transaction)
+    return connection
 
 
 class Test_PendingLog:
@@ -199,6 +209,120 @@ class TestNoOpRequestLogRecorder:
         recorder = NoOpRequestLogRecorder()
         # Should not raise
         recorder.flush()
+
+    def test_noop_ignores_on_commit_callback(self) -> None:
+        """No-op recorder accepts a callback without scheduling it."""
+        callback_transactions: list[str] = []
+
+        async def on_commit(transaction_id: str) -> None:
+            callback_transactions.append(transaction_id)
+
+        recorder = NoOpRequestLogRecorder(on_commit=on_commit)
+
+        recorder.flush()
+
+        assert callback_transactions == []
+
+
+class TestRequestLogPostCommit:
+    """Tests the durable post-commit callback contract."""
+
+    @staticmethod
+    async def _create_request_log_database(database_path: Path) -> DatabasePool:
+        db_pool = DatabasePool(f"sqlite:///{database_path}")
+        pool = await db_pool.get_pool()
+        await pool.execute(
+            """
+            CREATE TABLE request_logs (
+                id INTEGER PRIMARY KEY,
+                transaction_id TEXT NOT NULL,
+                session_id TEXT,
+                user_id TEXT,
+                direction TEXT NOT NULL,
+                http_method TEXT,
+                url TEXT,
+                request_headers TEXT,
+                request_body TEXT,
+                response_status INTEGER,
+                response_headers TEXT,
+                response_body TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                duration_ms REAL,
+                model TEXT,
+                is_streaming INTEGER,
+                endpoint TEXT,
+                error TEXT
+            )
+            """
+        )
+        return db_pool
+
+    @pytest.mark.asyncio
+    async def test_on_commit_receives_transaction_id_after_durable_write(self, tmp_path: Path) -> None:
+        """Callback sees both committed rows and receives the transaction ID."""
+        database_path = tmp_path / "request_logs.db"
+        db_pool = await self._create_request_log_database(database_path)
+        callback_observations: list[tuple[str, int]] = []
+
+        async def on_commit(transaction_id: str) -> None:
+            async with aiosqlite.connect(database_path) as connection:
+                cursor = await connection.execute("SELECT COUNT(*) FROM request_logs")
+                row = await cursor.fetchone()
+            assert row is not None
+            callback_observations.append((transaction_id, int(row[0])))
+
+        recorder = RequestLogRecorder(db_pool, "txn-committed", on_commit=on_commit)
+        try:
+            await recorder._write_logs()
+        finally:
+            await db_pool.close()
+
+        assert callback_observations == [("txn-committed", 2)]
+
+    @pytest.mark.asyncio
+    async def test_on_commit_is_not_called_when_raw_log_write_fails(self, tmp_path: Path) -> None:
+        """A failed raw-log write suppresses the post-commit callback."""
+        database_path = tmp_path / "missing_request_logs.db"
+        db_pool = DatabasePool(f"sqlite:///{database_path}")
+        callback_transactions: list[str] = []
+
+        async def on_commit(transaction_id: str) -> None:
+            callback_transactions.append(transaction_id)
+
+        recorder = RequestLogRecorder(db_pool, "txn-failed", on_commit=on_commit)
+        dropped_writes_before = RequestLogRecorder.dropped_writes
+        try:
+            await recorder._write_logs()
+        finally:
+            await db_pool.close()
+
+        assert callback_transactions == []
+        assert RequestLogRecorder.dropped_writes == dropped_writes_before + 1
+
+    @pytest.mark.asyncio
+    async def test_on_commit_exception_does_not_fail_durable_write(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Callback failures are warned and leave committed rows intact."""
+        database_path = tmp_path / "callback_failure.db"
+        db_pool = await self._create_request_log_database(database_path)
+
+        async def on_commit(transaction_id: str) -> None:
+            raise RuntimeError(f"callback failed for {transaction_id}")
+
+        recorder = RequestLogRecorder(db_pool, "txn-callback-failed", on_commit=on_commit)
+        dropped_writes_before = RequestLogRecorder.dropped_writes
+        try:
+            with caplog.at_level(logging.WARNING):
+                await recorder._write_logs()
+            rows = await (await db_pool.get_pool()).fetch("SELECT transaction_id FROM request_logs")
+        finally:
+            await db_pool.close()
+
+        assert len(rows) == 2
+        assert RequestLogRecorder.dropped_writes == dropped_writes_before
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
 
 
 class TestRequestLogRecorder:
@@ -443,7 +567,7 @@ class TestRequestLogRecorder:
     async def test_write_logs_inserts_both_rows(self) -> None:
         """_write_logs() inserts both inbound and outbound log rows."""
         # Create a mock connection that tracks execute calls
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         # Create a mock db_pool
@@ -477,7 +601,7 @@ class TestRequestLogRecorder:
     @pytest.mark.asyncio
     async def test_write_logs_constructs_correct_sql(self) -> None:
         """_write_logs() constructs the expected INSERT statement."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -507,7 +631,7 @@ class TestRequestLogRecorder:
     @pytest.mark.asyncio
     async def test_write_logs_serializes_json_fields(self) -> None:
         """_write_logs() JSON-serializes header and body fields."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -542,7 +666,7 @@ class TestRequestLogRecorder:
     @pytest.mark.asyncio
     async def test_write_logs_handles_none_json_fields(self) -> None:
         """_write_logs() passes None for missing JSON fields."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -571,7 +695,7 @@ class TestRequestLogRecorder:
     @pytest.mark.asyncio
     async def test_write_logs_catches_and_logs_db_exceptions(self) -> None:
         """_write_logs() catches DB-specific exceptions and logs them without raising."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -598,7 +722,7 @@ class TestRequestLogRecorder:
         self,
         metric_reader: InMemoryMetricReader,
     ) -> None:
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -617,7 +741,7 @@ class TestRequestLogRecorder:
     @pytest.mark.asyncio
     async def test_write_logs_wraps_any_exception_as_write_failure(self) -> None:
         """Any exception from the DB call is treated as a write failure and caught."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock(side_effect=ValueError("unexpected"))
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -635,7 +759,7 @@ class TestRequestLogRecorder:
     @pytest.mark.asyncio
     async def test_write_logs_catches_os_errors(self) -> None:
         """_write_logs() catches OSError (network-level failures)."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock(side_effect=OSError("connection refused"))
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -653,7 +777,7 @@ class TestRequestLogRecorder:
     @pytest.mark.asyncio
     async def test_write_logs_context_manager_cleanup(self) -> None:
         """_write_logs() properly uses connection context manager for cleanup."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         mock_context_mgr = MagicMock()
@@ -677,7 +801,7 @@ class TestRequestLogRecorder:
         self,
         span_exporter: InMemorySpanExporter,
     ) -> None:
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -707,7 +831,7 @@ class TestRequestLogRecorder:
         self,
         metric_reader: InMemoryMetricReader,
     ) -> None:
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -730,7 +854,7 @@ class TestRequestLogRecorder:
         self,
         span_exporter: InMemorySpanExporter,
     ) -> None:
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -753,7 +877,7 @@ class TestRequestLogRecorderIntegration:
     @pytest.mark.asyncio
     async def test_complete_request_response_cycle(self) -> None:
         """Test a complete inbound + outbound request/response cycle."""
-        mock_conn = AsyncMock()
+        mock_conn = _make_transactional_connection()
         mock_conn.execute = AsyncMock()
 
         db_pool = MagicMock(spec=DatabasePool)
@@ -966,7 +1090,7 @@ class TestBodyTruncation:
 
 
 class TestInsertLogRow:
-    """Tests for _insert_log_row — the DB-agnostic insert helper.
+    """Tests for insert_log_row — the DB-agnostic insert helper.
 
     Verifies that any driver exception (asyncpg, aiosqlite, or generic) is
     wrapped in DatabaseWriteError with the original exception as .cause.
@@ -987,7 +1111,7 @@ class TestInsertLogRow:
         conn.execute = AsyncMock(side_effect=cause)
 
         with pytest.raises(DatabaseWriteError) as exc_info:
-            await _insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
+            await insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
 
         assert exc_info.value.cause is cause
 
@@ -999,7 +1123,7 @@ class TestInsertLogRow:
         conn.execute = AsyncMock(side_effect=cause)
 
         with pytest.raises(DatabaseWriteError) as exc_info:
-            await _insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
+            await insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
 
         assert exc_info.value.cause is cause
 
@@ -1011,7 +1135,7 @@ class TestInsertLogRow:
         conn.execute = AsyncMock(side_effect=cause)
 
         with pytest.raises(DatabaseWriteError) as exc_info:
-            await _insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
+            await insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
 
         assert exc_info.value.cause is cause
 
@@ -1022,7 +1146,7 @@ class TestInsertLogRow:
         conn.execute = AsyncMock(side_effect=OSError("disk full"))
 
         with pytest.raises(DatabaseWriteError) as exc_info:
-            await _insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
+            await insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
 
         msg = str(exc_info.value)
         assert "inbound" in msg
@@ -1034,5 +1158,5 @@ class TestInsertLogRow:
         conn = AsyncMock()
         conn.execute = AsyncMock()
 
-        await _insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
+        await insert_log_row(conn, self._make_pending(), self._empty_serialized_body)
         conn.execute.assert_called_once()

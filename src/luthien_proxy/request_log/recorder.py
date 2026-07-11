@@ -16,12 +16,14 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
 from opentelemetry import metrics, trace
 from opentelemetry.trace import Status, StatusCode
 
+from luthien_proxy.request_log.models import _PendingLog, insert_log_row
 from luthien_proxy.request_log.sanitize import sanitize_headers
 from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
 
@@ -39,8 +41,8 @@ db_write_duration_histogram = meter.create_histogram(
     description="Duration of DB request-log writes",
 )
 
-# Bodies larger than this are replaced with a truncation notice
-MAX_BODY_BYTES = 1_048_576  # 1 MB
+# Agentic multi-provider captures can exceed 1 MB; keep full bodies for transcript replay.
+MAX_BODY_BYTES = 8_388_608  # 8 MB
 
 
 def _log_task_exception(task: asyncio.Task[None]) -> None:
@@ -49,107 +51,11 @@ def _log_task_exception(task: asyncio.Task[None]) -> None:
         logger.error("Background request log write failed", exc_info=task.exception())
 
 
-@dataclass
-class _PendingLog:
-    """Accumulates data for a single log row before it's written to DB."""
-
-    direction: str
-    transaction_id: str
-    session_id: str | None = None
-    user_id: str | None = None
-    http_method: str | None = None
-    url: str | None = None
-    request_headers: dict[str, str] | None = None
-    request_body: dict[str, Any] | None = None
-    response_status: int | None = None
-    response_headers: dict[str, str] | None = None
-    response_body: dict[str, Any] | None = None
-    started_at: float = field(default_factory=time.time)
-    completed_at: float | None = None
-    duration_ms: float | None = None
-    model: str | None = None
-    is_streaming: bool = False
-    endpoint: str | None = None
-    error: str | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class _SerializedBody:
     payload: str | None
     size_bytes: int
     truncated: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _SerializedLogBodySizes:
-    request_body_bytes: int
-    response_body_bytes: int
-    body_truncated: bool
-
-
-async def _insert_log_row(
-    conn: object,
-    pending: _PendingLog,
-    serialize_body: Callable[[dict[str, Any] | None], _SerializedBody],
-) -> _SerializedLogBodySizes:
-    """Insert one request_logs row via the DB-agnostic connection interface.
-
-    Raises DatabaseWriteError on any failure so callers don't need to know
-    which driver (asyncpg, aiosqlite, etc.) is in use.
-
-    The SQL avoids the CASE WHEN $N ... $N pattern (duplicate positional
-    parameters) that breaks SQLite's ? placeholders. A None completed_at
-    becomes NULL via to_timestamp(NULL) on both Postgres and SQLite.
-    """
-    request_body = serialize_body(pending.request_body)
-    response_body = serialize_body(pending.response_body)
-    try:
-        await conn.execute(  # type: ignore[union-attr]
-            """
-            INSERT INTO request_logs (
-                transaction_id, session_id, user_id, direction,
-                http_method, url, request_headers, request_body,
-                response_status, response_headers, response_body,
-                started_at, completed_at, duration_ms,
-                model, is_streaming, endpoint, error
-            ) VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7::jsonb, $8::jsonb,
-                $9, $10::jsonb, $11::jsonb,
-                to_timestamp($12), to_timestamp($13), $14,
-                $15, $16, $17, $18
-            )
-            """,
-            pending.transaction_id,
-            pending.session_id,
-            pending.user_id,
-            pending.direction,
-            pending.http_method,
-            pending.url,
-            json.dumps(pending.request_headers) if pending.request_headers else None,
-            request_body.payload,
-            pending.response_status,
-            json.dumps(pending.response_headers) if pending.response_headers else None,
-            response_body.payload,
-            pending.started_at,
-            pending.completed_at,
-            pending.duration_ms,
-            pending.model,
-            pending.is_streaming,
-            pending.endpoint,
-            pending.error,
-        )
-    except Exception as exc:
-        raise DatabaseWriteError(
-            f"Failed to insert request_log row (direction={pending.direction!r}, "
-            f"transaction_id={pending.transaction_id!r}): {exc}",
-            cause=exc,
-        ) from exc
-    return _SerializedLogBodySizes(
-        request_body_bytes=request_body.size_bytes,
-        response_body_bytes=response_body.size_bytes,
-        body_truncated=request_body.truncated or response_body.truncated,
-    )
 
 
 class RequestLogRecorder:
@@ -165,9 +71,16 @@ class RequestLogRecorder:
 
     dropped_writes: int = 0
 
-    def __init__(self, db_pool: DatabasePool, transaction_id: str) -> None:  # noqa: D107
+    def __init__(  # noqa: D107
+        self,
+        db_pool: DatabasePool,
+        transaction_id: str,
+        *,
+        on_commit: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         self._db_pool = db_pool
         self._transaction_id = transaction_id
+        self._on_commit = on_commit
         self._inbound = _PendingLog(direction="inbound", transaction_id=transaction_id)
         self._outbound = _PendingLog(direction="outbound", transaction_id=transaction_id)
 
@@ -179,7 +92,7 @@ class RequestLogRecorder:
         method: str,
         url: str,
         headers: dict[str, str],
-        body: dict[str, Any],
+        body: dict[str, Any] | None,
         session_id: str | None = None,
         user_id: str | None = None,
         model: str | None = None,
@@ -219,7 +132,7 @@ class RequestLogRecorder:
     def record_outbound_request(
         self,
         *,
-        body: dict[str, Any],
+        body: dict[str, Any] | None,
         method: str = "POST",
         url: str | None = None,
         model: str | None = None,
@@ -286,14 +199,25 @@ class RequestLogRecorder:
         request_body_bytes = 0
         response_body_bytes = 0
         body_truncated = False
+        write_succeeded = False
         with tracer.start_as_current_span("request_log.write") as span:
             try:
                 async with self._db_pool.connection() as conn:
-                    for pending in (self._inbound, self._outbound):
-                        body_sizes = await _insert_log_row(conn, pending, self._serialize_body)
-                        request_body_bytes += body_sizes.request_body_bytes
-                        response_body_bytes += body_sizes.response_body_bytes
-                        body_truncated = body_truncated or body_sizes.body_truncated
+                    async with conn.transaction():
+                        cache: dict[int, _SerializedBody] = {}
+
+                        def serialize_body(body: dict[str, Any] | None) -> _SerializedBody:
+                            key = id(body)
+                            if key not in cache:
+                                cache[key] = self._serialize_body(body)
+                            return cache[key]
+
+                        for pending in (self._inbound, self._outbound):
+                            body_sizes = await insert_log_row(conn, pending, serialize_body)
+                            request_body_bytes += body_sizes.request_body_bytes
+                            response_body_bytes += body_sizes.response_body_bytes
+                            body_truncated = body_truncated or body_sizes.body_truncated
+                write_succeeded = True
             except DatabaseWriteError as exc:
                 span.set_status(Status(StatusCode.ERROR, "db write failed"))
                 RequestLogRecorder.dropped_writes += 1
@@ -312,6 +236,18 @@ class RequestLogRecorder:
                 span.set_attribute("luthien.request_log.response_body_bytes", response_body_bytes)
                 span.set_attribute("luthien.request_log.body_truncated", body_truncated)
 
+        if not write_succeeded or self._on_commit is None:
+            return
+
+        try:
+            await self._on_commit(self._transaction_id)
+        except Exception:
+            logger.warning(
+                "Request log post-commit callback failed for %s",
+                self._transaction_id,
+                exc_info=True,
+            )
+
 
 class NoOpRequestLogRecorder(RequestLogRecorder):
     """Drop-in replacement that does nothing — used when logging is disabled.
@@ -319,7 +255,9 @@ class NoOpRequestLogRecorder(RequestLogRecorder):
     All methods are intentional no-ops.
     """
 
-    def __init__(self) -> None:  # noqa: D107
+    def __init__(  # noqa: D107, ARG002
+        self, *, on_commit: Callable[[str], Awaitable[None]] | None = None
+    ) -> None:
         pass
 
     def record_inbound_request(  # noqa: D102, ARG002
@@ -376,14 +314,16 @@ def create_recorder(
     db_pool: DatabasePool | None,
     transaction_id: str,
     enabled: bool,
+    *,
+    on_commit: Callable[[str], Awaitable[None]] | None = None,
 ) -> RequestLogRecorder:
     """Factory that always returns a recorder — real or no-op based on config.
 
     Callers never need to null-check the return value.
     """
     if not enabled or db_pool is None:
-        return NoOpRequestLogRecorder()
-    return RequestLogRecorder(db_pool=db_pool, transaction_id=transaction_id)
+        return NoOpRequestLogRecorder(on_commit=on_commit)
+    return RequestLogRecorder(db_pool=db_pool, transaction_id=transaction_id, on_commit=on_commit)
 
 
 __all__ = ["RequestLogRecorder", "NoOpRequestLogRecorder", "create_recorder"]
