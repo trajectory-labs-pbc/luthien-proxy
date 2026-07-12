@@ -3,10 +3,10 @@
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import opentelemetry.metrics._internal as metrics_internal
 import pytest
 from anthropic import APIConnectionError as AnthropicConnectionError
 from anthropic import APIStatusError as AnthropicStatusError
@@ -25,9 +25,7 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from httpx import Request as HttpxRequest
 from httpx import Response as HttpxResponse
-from opentelemetry import metrics
-from opentelemetry import trace
-import opentelemetry.metrics._internal as metrics_internal
+from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
@@ -36,9 +34,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from tests.constants import DEFAULT_TEST_MODEL
 from tests.luthien_proxy.fixtures.policy_context import make_policy_context
 
-from luthien_proxy.pipeline import anthropic_processor as anthropic_processor_mod
 from luthien_proxy.exceptions import BackendAPIError
 from luthien_proxy.llm.types.anthropic import AnthropicRequest, AnthropicResponse, build_usage
+from luthien_proxy.pipeline import anthropic_processor as anthropic_processor_mod
 from luthien_proxy.pipeline.anthropic_processor import (
     _AnthropicPolicyIO,
     _build_error_event,
@@ -2858,7 +2856,6 @@ class TestWebhookFireIsolation:
 
         webhook.fire_and_forget.assert_called_once()
         recorder.flush.assert_called()  # cleanup completed despite webhook failure
-
 
 
 class TestStreamWithKeepalive:

@@ -342,16 +342,16 @@ def test_gemini_normalization_raises_typed_errors_for_malformed_and_unknown_elig
         "contents",
     )
     assert (unknown_request_error.value.reason, unknown_request_error.value.detail) == (
-        PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
-        "user.part",
+        PassthroughNormalizeReason.MISSING_REQUIRED_FIELD,
+        "contents",
     )
     assert (unknown_finish_error.value.reason, unknown_finish_error.value.detail) == (
         PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
         "candidate.finishReason:NEW_REASON",
     )
     assert (malformed_part_error.value.reason, malformed_part_error.value.detail) == (
-        PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
-        "candidate.part.functionResponse",
+        PassthroughNormalizeReason.MISSING_REQUIRED_FIELD,
+        "candidate.content",
     )
 
 
@@ -422,7 +422,7 @@ def test_selects_the_zero_indexed_candidate_when_gemini_returns_multiple_candida
     ]
 
 
-def test_rejects_a_function_response_without_its_required_function_name() -> None:
+def test_rejects_request_without_a_recoverable_function_response() -> None:
     # Given
     request = {
         "contents": [
@@ -439,7 +439,7 @@ def test_rejects_a_function_response_without_its_required_function_name() -> Non
 
     assert (exc_info.value.reason, exc_info.value.detail) == (
         PassthroughNormalizeReason.MISSING_REQUIRED_FIELD,
-        "functionResponse.name",
+        "contents",
     )
 
 
@@ -716,8 +716,8 @@ def test_preserves_id_bearing_gemini_3_tool_pairing() -> None:
                 ],
                 "final": None,
             },
-            PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
-            "candidate.part",
+            PassthroughNormalizeReason.MISSING_REQUIRED_FIELD,
+            "candidate.finishReason",
         ),
         (
             {
@@ -746,3 +746,62 @@ def test_stream_normalization_raises_typed_errors_when_wrapper_or_chunk_is_incom
         )
 
     assert (exc_info.value.reason, exc_info.value.detail) == (reason, detail)
+
+def test_stream_normalization_falls_back_to_raw_when_chunk_has_unmodelled_field() -> None:
+    # Given: a stream chunk carrying a field the google-genai SDK model doesn't
+    # know about yet (usageMetadata.serviceTier is the concrete case observed in
+    # prod). The buffered path (normalize_gemini_response) falls back to the raw
+    # payload on ValidationError; the stream path must mirror that or streamed
+    # and buffered captures of the same conversation get opposite outcomes.
+    response = {
+        "stream_format": "gemini-sse",
+        "chunks": [
+            {
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "hi"}]},
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 2,
+                    "serviceTier": "standard",
+                },
+            },
+        ],
+        "final": None,
+    }
+
+    # When
+    normalized = normalize_gemini_response(
+        _stream_generate_content_endpoint(),
+        response,
+        request_is_streaming=True,
+        http_status=200,
+        transaction_id="txn_gemini_stream_service_tier",
+    )
+
+    # Then: the chunk normalizes cleanly (no MALFORMED_PAYLOAD), and usage from the
+    # unmodelled-field-carrying chunk is preserved.
+    payload = build_response_event_payload(normalized)
+    assert payload["final_response"]["usage"]["input_tokens"] == 1
+    assert payload["final_response"]["usage"]["output_tokens"] == 1
+
+def test_normalizes_gemini_request_when_content_role_is_omitted_defaults_to_user() -> None:
+    # Given: Gemini API spec makes `role` OPTIONAL in contents[] (defaults to "user").
+    # A minimal probe like {"contents": [{"parts": [{"text": "..."}]}]} is a valid Gemini call
+    # (observed in prod as a health-check probe against gemini-2.5-flash) and must materialize.
+    request = {"contents": [{"parts": [{"text": "say prod-capture-ok"}]}]}
+
+    # When
+    normalized = normalize_gemini_request(
+        _generate_content_endpoint(), request, transaction_id="txn_gemini_no_role"
+    )
+    payload = build_request_event_payload(normalized)
+
+    # Then: the message role defaults to "user" instead of failing MISSING_REQUIRED_FIELD:contents.
+    assert payload["final_request"]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "say prod-capture-ok"}]},
+    ]

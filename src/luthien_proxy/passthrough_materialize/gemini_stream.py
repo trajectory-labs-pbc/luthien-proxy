@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from pydantic import ValidationError
+
 from luthien_proxy.passthrough_materialize.endpoints import EligibleEndpoint
 from luthien_proxy.passthrough_materialize.gemini_common import (
     gemini_content_free_parts,
@@ -25,6 +27,7 @@ from luthien_proxy.passthrough_materialize.openai_common import (
     sequence_field,
 )
 from luthien_proxy.passthrough_materialize.payloads import JsonMutableObject, JsonMutableValue, JsonObject, JsonValue
+from luthien_proxy.passthrough_materialize.provider_models import parse_gemini_response
 
 
 @dataclass(slots=True)
@@ -87,6 +90,14 @@ def _add_chunk(
 ) -> None:
     if not is_json_object(raw_chunk):
         fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "stream chunk")
+    try:
+        raw_chunk = parse_gemini_response(raw_chunk).model_dump(mode="json", by_alias=True, exclude_none=True)
+    except ValidationError:
+        # Best-effort SDK: the google-genai response model is strict (extra='forbid')
+        # and lags the live REST API (e.g. it rejects usageMetadata.serviceTier);
+        # keep the raw chunk so the downstream lenient mapping can proceed. Mirrors
+        # the buffered-response fallback in gemini_response.normalize_gemini_response.
+        pass
     recognized = False
     response_id = raw_chunk.get("responseId")
     if response_id is not None:
@@ -170,14 +181,9 @@ def _add_parts(
                 _add_function_call(endpoint, accumulator, call, function_ordinal, transaction_id)
                 function_ordinal += 1
             case {"functionResponse": _}:
-                fail(
-                    endpoint,
-                    transaction_id,
-                    PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
-                    "candidate.part.functionResponse",
-                )
+                continue
             case _:
-                fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, "candidate.part")
+                continue
 
 
 def _add_function_call(

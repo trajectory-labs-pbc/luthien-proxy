@@ -70,14 +70,6 @@ def require_openai_endpoint(endpoint: EligibleEndpoint, kind: EndpointKind, tran
         fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_ENDPOINT, "endpoint kind mismatch")
 
 
-def object_field(endpoint: EligibleEndpoint, value: JsonObject, key: str, transaction_id: str | None) -> JsonObject:
-    """Return a required JSON object field or raise a typed error."""
-    item = value.get(key)
-    if is_json_object(item):
-        return item
-    fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, key)
-
-
 def sequence_field(
     endpoint: EligibleEndpoint, value: JsonObject, key: str, transaction_id: str | None
 ) -> Sequence[JsonValue]:
@@ -121,32 +113,22 @@ def json_mutable(value: JsonValue) -> JsonMutableValue:
             return [json_mutable(item) for item in value]
 
 
-def text_content_from_openai(
-    endpoint: EligibleEndpoint, content: JsonValue, transaction_id: str | None, *, input_prefix: str
-) -> JsonMutableValue:
-    """Normalize OpenAI text-only content into history-compatible content."""
+def lenient_text_content_from_openai(content: JsonValue) -> str | list[JsonMutableValue] | None:
+    """Return recoverable text content while omitting unknown request blocks."""
     match content:
         case str():
             return content
         case Sequence() if not isinstance(content, str):
             blocks: list[JsonMutableValue] = []
             for block in content:
-                if not is_json_object(block):
-                    fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "content block")
-                block_type = block.get("type")
-                match block_type:
-                    case "text" | "input_text" | "output_text":
-                        text = block.get("text")
-                        if not isinstance(text, str):
-                            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "text block")
+                match block:
+                    case {"type": "text" | "input_text" | "output_text", "text": str() as text}:
                         blocks.append({"type": "text", "text": text})
                     case _:
-                        fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, input_prefix)
-            return blocks
-        case None:
-            return ""
+                        continue
+            return blocks or None
         case _:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, input_prefix)
+            return None
 
 
 def canonical_usage(usage: JsonValue) -> JsonMutableObject | None:
@@ -163,7 +145,41 @@ def canonical_usage(usage: JsonValue) -> JsonMutableObject | None:
     total_tokens = usage.get("total_tokens")
     if isinstance(total_tokens, int):
         result["total_tokens"] = total_tokens
+    # Reasoning-model token accounting: Chat Completions nests under
+    # `completion_tokens_details.reasoning_tokens`; Responses nests under
+    # `output_tokens_details.reasoning_tokens`. Reasoning tokens are
+    # already counted inside `output_tokens`; we surface them separately so
+    # downstream consumers can distinguish reasoning from visible output.
+    reasoning_tokens = _reasoning_tokens(usage)
+    if isinstance(reasoning_tokens, int):
+        result["reasoning_tokens"] = reasoning_tokens
     return result or None
+
+
+def _reasoning_tokens(usage: Mapping[str, JsonValue]) -> int | None:
+    for details_key in ("completion_tokens_details", "output_tokens_details"):
+        details = usage.get(details_key)
+        if not isinstance(details, Mapping):
+            continue
+        reasoning = details.get("reasoning_tokens")
+        if not isinstance(reasoning, int) or isinstance(reasoning, bool):
+            continue
+        # Non-reasoning models omit the field entirely at the API level; the SDK
+        # parser (provider_models.parse_openai_response) injects `0` as a default
+        # to satisfy required-field validation. Treat 0 as absent so we don't
+        # pollute non-reasoning-model outputs with a spurious `reasoning_tokens: 0`.
+        if reasoning == 0:
+            continue
+        return reasoning
+    return None
+    for details_key in ("completion_tokens_details", "output_tokens_details"):
+        details = usage.get(details_key)
+        if not isinstance(details, Mapping):
+            continue
+        reasoning = details.get("reasoning_tokens")
+        if isinstance(reasoning, int) and not isinstance(reasoning, bool):
+            return reasoning
+    return None
 
 
 def _first_int(usage: Mapping[str, JsonValue], first_key: str, second_key: str) -> int | None:
@@ -197,7 +213,12 @@ def stop_reason(reason: str | None) -> str:
             return "tool_use"
         case "length":
             return "max_tokens"
-        case "stop" | "content_filter" | None:
+        case "content_filter":
+            # OpenAI's content_filter is a safety-policy block. Map to the same
+            # canonical safety bucket the Gemini normalizer uses so downstream
+            # consumers can distinguish real completions from safety-blocked ones.
+            return "safety"
+        case "stop" | None:
             return "end_turn"
         case _:
             return "end_turn"

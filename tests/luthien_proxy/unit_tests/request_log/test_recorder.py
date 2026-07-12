@@ -23,10 +23,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import asyncpg
-import pytest
-from opentelemetry import metrics
-from opentelemetry import trace
 import opentelemetry.metrics._internal as metrics_internal
+import pytest
+from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
@@ -35,6 +34,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 from luthien_proxy.request_log import recorder as recorder_mod
+from luthien_proxy.request_log.models import _PendingLog, insert_log_row
 from luthien_proxy.request_log.recorder import (
     MAX_BODY_BYTES,
     NoOpRequestLogRecorder,
@@ -42,7 +42,6 @@ from luthien_proxy.request_log.recorder import (
     _SerializedBody,
     create_recorder,
 )
-from luthien_proxy.request_log.models import _PendingLog, insert_log_row
 from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
 
 

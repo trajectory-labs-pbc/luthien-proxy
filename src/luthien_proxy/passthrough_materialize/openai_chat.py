@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Mapping, Sequence
+
+from openai.types.chat import ChatCompletionMessageFunctionToolCall, ChatCompletionMessageToolCallUnion
+from pydantic import ValidationError
 
 from luthien_proxy.passthrough_materialize.endpoints import EligibleEndpoint, EndpointKind
 from luthien_proxy.passthrough_materialize.openai_chat_stream import stream_chat_response
@@ -15,12 +19,11 @@ from luthien_proxy.passthrough_materialize.openai_common import (
     is_json_sequence,
     json_mutable_object,
     json_object_from_string,
-    object_field,
+    lenient_text_content_from_openai,
     optional_string,
     require_openai_endpoint,
     sequence_field,
     stop_reason,
-    text_content_from_openai,
 )
 from luthien_proxy.passthrough_materialize.payloads import (
     CanonicalRequestInput,
@@ -30,6 +33,7 @@ from luthien_proxy.passthrough_materialize.payloads import (
     JsonObject,
     JsonValue,
 )
+from luthien_proxy.passthrough_materialize.provider_models import parse_openai_chat_completion
 
 
 def normalize_openai_chat_request(
@@ -40,7 +44,7 @@ def normalize_openai_chat_request(
     model = optional_string(request, "model")
     messages = sequence_field(endpoint, request, "messages", transaction_id)
     final_request: JsonMutableObject = {"model": model, "messages": _chat_messages(endpoint, messages, transaction_id)}
-    _copy_optional_request_fields(request, final_request, endpoint, transaction_id)
+    _copy_optional_request_fields(request, final_request)
     stream = request.get("stream") is True
     final_request["stream"] = stream
     return CanonicalRequestInput(
@@ -88,77 +92,77 @@ def _chat_messages(
     if not is_json_sequence(messages):
         fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "messages")
     for item in messages:
-        if not is_json_object(item):
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "message")
-        role = item.get("role")
-        if not isinstance(role, str):
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "message.role")
-        result.append(_chat_message(endpoint, role, item, transaction_id))
+        if is_json_object(item):
+            message = _chat_message(item)
+            if message is not None:
+                result.append(message)
+    if not result:
+        fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "messages")
     return result
 
 
-def _chat_message(
-    endpoint: EligibleEndpoint, role: str, item: Mapping[str, JsonValue], transaction_id: str | None
-) -> JsonMutableObject:
+def _chat_message(item: Mapping[str, JsonValue]) -> JsonMutableObject | None:
+    role = optional_string(item, "role")
     canonical_role = "system" if role == "developer" else role
     match canonical_role:
-        case "system" | "user" | "tool":
-            content = text_content_from_openai(
-                endpoint, item.get("content"), transaction_id, input_prefix="message.content"
-            )
-            message: JsonMutableObject = {"role": canonical_role, "content": content}
+        case "system" | "user":
+            content = lenient_text_content_from_openai(item.get("content"))
+            if content is None:
+                return None
+            return {"role": canonical_role, "content": content}
+        case "tool":
+            content = lenient_text_content_from_openai(item.get("content"))
             tool_call_id = item.get("tool_call_id")
-            if isinstance(tool_call_id, str):
-                message["tool_call_id"] = tool_call_id
-            return message
+            if content is None or not isinstance(tool_call_id, str):
+                return None
+            return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
         case "assistant":
             content_blocks: list[JsonMutableValue] = []
-            content = item.get("content")
-            if content is not None:
-                normalized = text_content_from_openai(
-                    endpoint, content, transaction_id, input_prefix="assistant.content"
-                )
-                if isinstance(normalized, str):
+            normalized = lenient_text_content_from_openai(item.get("content"))
+            match normalized:
+                case str():
                     content_blocks.append({"type": "text", "text": normalized})
-                elif isinstance(normalized, list):
+                case list():
                     content_blocks.extend(normalized)
-            content_blocks.extend(_tool_calls(endpoint, item.get("tool_calls"), transaction_id))
-            return {"role": "assistant", "content": content_blocks}
+                case None:
+                    pass
+            content_blocks.extend(_tool_calls(item.get("tool_calls")))
+            return {"role": "assistant", "content": content_blocks} if content_blocks else None
         case _:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, "message.role")
+            return None
 
 
-def _tool_calls(endpoint: EligibleEndpoint, raw_calls: JsonValue, transaction_id: str | None) -> list[JsonMutableValue]:
-    if raw_calls is None:
-        return []
+def _tool_calls(raw_calls: JsonValue) -> list[JsonMutableValue]:
     if not is_json_sequence(raw_calls):
-        fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "tool_calls")
+        return []
     calls: list[JsonMutableValue] = []
     for raw_call in raw_calls:
         if not is_json_object(raw_call):
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "tool_call")
-        function = object_field(endpoint, raw_call, "function", transaction_id)
-        name = optional_string(function, "name")
+            continue
+        function = raw_call.get("function")
+        if not is_json_object(function):
+            continue
         arguments = optional_string(function, "arguments") or "{}"
-        call_id = optional_string(raw_call, "id")
-        if not call_id:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "tool_call.id")
-        if name is None:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "tool_call.function.name")
+        if (call_id := optional_string(raw_call, "id")) is None or (name := optional_string(function, "name")) is None:
+            continue
+        try:
+            arguments_value = json.loads(arguments)
+        except json.JSONDecodeError:
+            continue
+        if not is_json_object(arguments_value):
+            continue
         calls.append(
             {
                 "type": "tool_use",
                 "id": call_id,
                 "name": name,
-                "input": json_object_from_string(endpoint, arguments, transaction_id),
+                "input": json_mutable_object(arguments_value),
             }
         )
     return calls
 
 
-def _copy_optional_request_fields(
-    request: JsonObject, final_request: JsonMutableObject, endpoint: EligibleEndpoint, transaction_id: str | None
-) -> None:
+def _copy_optional_request_fields(request: JsonObject, final_request: JsonMutableObject) -> None:
     for key in ("tool_choice", "temperature", "top_p", "stop", "max_completion_tokens", "max_tokens"):
         if key in request:
             final_request[key] = json_mutable_object({"value": request[key]})["value"]
@@ -166,23 +170,26 @@ def _copy_optional_request_fields(
         final_request["max_tokens"] = json_mutable_object({"value": request["max_completion_tokens"]})["value"]
     tools = request.get("tools")
     if tools is not None:
-        final_request["tools"] = _tools(endpoint, tools, transaction_id)
+        final_request["tools"] = _tools(tools)
 
 
-def _tools(endpoint: EligibleEndpoint, tools: JsonValue, transaction_id: str | None) -> list[JsonMutableValue]:
+def _tools(tools: JsonValue) -> list[JsonMutableValue]:
     if not is_json_sequence(tools):
-        fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "tools")
+        return []
     result: list[JsonMutableValue] = []
     for tool in tools:
         if not is_json_object(tool) or tool.get("type") != "function":
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, "tool")
-        function = object_field(endpoint, tool, "function", transaction_id)
+            continue
+        function = tool.get("function")
+        if not is_json_object(function):
+            continue
         name = optional_string(function, "name")
-        if name is None:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "tool.function.name")
+        parameters = function.get("parameters")
+        if name is None or not is_json_object(parameters):
+            continue
         canonical_tool: JsonMutableObject = {
             "name": name,
-            "input_schema": json_mutable_object(object_field(endpoint, function, "parameters", transaction_id)),
+            "input_schema": json_mutable_object(parameters),
         }
         description = optional_string(function, "description")
         if description is not None:
@@ -194,42 +201,76 @@ def _tools(endpoint: EligibleEndpoint, tools: JsonValue, transaction_id: str | N
 def _buffered_chat_response(
     endpoint: EligibleEndpoint, response: JsonObject, transaction_id: str | None
 ) -> JsonMutableObject:
-    choices = sequence_field(endpoint, response, "choices", transaction_id)
-    first = choices[0] if choices else None
-    if not is_json_object(first):
+    try:
+        parsed = parse_openai_chat_completion(response)
+    except ValidationError:
+        # The pinned openai SDK's strict Literals reject novel API values with an
+        # uncaught ValidationError; convert to a typed, retryable failure so a
+        # novel variant skips one transaction rather than wedging the batch.
+        fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "response")
+    if not parsed.choices:
         fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "choices[0]")
-    message = object_field(endpoint, first, "message", transaction_id)
+    first = parsed.choices[0]
+    message = first.message
     return _assistant_response(
-        response,
-        message,
-        optional_string(first, "finish_reason"),
-        canonical_usage(response.get("usage")),
+        parsed.id,
+        parsed.model,
+        message.content,
+        message.refusal,
+        message.tool_calls,
+        first.finish_reason,
+        canonical_usage(parsed.usage.model_dump() if parsed.usage is not None else None),
         endpoint,
         transaction_id,
     )
 
 
 def _assistant_response(
-    response: JsonObject,
-    message: JsonObject,
+    response_id: str,
+    model: str,
+    text: str | None,
+    refusal: str | None,
+    tool_calls: Sequence[ChatCompletionMessageToolCallUnion] | None,
     finish_reason: str | None,
     usage: JsonMutableObject | None,
     endpoint: EligibleEndpoint,
     transaction_id: str | None,
 ) -> JsonMutableObject:
     content: list[JsonMutableValue] = []
-    text = optional_string(message, "content")
     if text:
         content.append({"type": "text", "text": text})
-    refusal = optional_string(message, "refusal")
     if refusal:
         content.append({"type": "text", "text": refusal})
-    content.extend(_tool_calls(endpoint, message.get("tool_calls"), transaction_id))
+    content.extend(_typed_tool_calls(endpoint, tool_calls, transaction_id))
     final: JsonMutableObject = {"role": "assistant", "content": content, "stop_reason": stop_reason(finish_reason)}
-    for key in ("id", "model"):
-        value = optional_string(response, key)
-        if value is not None:
-            final[key] = value
+    final["id"] = response_id
+    final["model"] = model
     if usage is not None:
         final["usage"] = usage
     return final
+
+
+def _typed_tool_calls(
+    endpoint: EligibleEndpoint,
+    tool_calls: Sequence[ChatCompletionMessageToolCallUnion] | None,
+    transaction_id: str | None,
+) -> list[JsonMutableValue]:
+    if tool_calls is None:
+        return []
+    calls: list[JsonMutableValue] = []
+    for call in tool_calls:
+        match call:
+            case ChatCompletionMessageFunctionToolCall(id=call_id, function=function):
+                if not call_id:
+                    fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "tool_call.id")
+                calls.append(
+                    {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": function.name,
+                        "input": json_object_from_string(endpoint, function.arguments, transaction_id),
+                    }
+                )
+            case _:
+                continue
+    return calls

@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputItem,
+    ResponseOutputMessage,
+    ResponseOutputRefusal,
+    ResponseOutputText,
+)
+from pydantic import ValidationError
+
 from luthien_proxy.passthrough_materialize.endpoints import EligibleEndpoint, EndpointKind
 from luthien_proxy.passthrough_materialize.openai_common import (
     PassthroughNormalizeReason,
@@ -15,10 +24,9 @@ from luthien_proxy.passthrough_materialize.openai_common import (
     json_mutable,
     json_mutable_object,
     json_object_from_string,
-    object_field,
+    lenient_text_content_from_openai,
     optional_string,
     require_openai_endpoint,
-    text_content_from_openai,
 )
 from luthien_proxy.passthrough_materialize.openai_responses_stream import fold_response_stream
 from luthien_proxy.passthrough_materialize.payloads import (
@@ -29,6 +37,7 @@ from luthien_proxy.passthrough_materialize.payloads import (
     JsonObject,
     JsonValue,
 )
+from luthien_proxy.passthrough_materialize.provider_models import parse_openai_response
 
 
 def normalize_openai_responses_request(
@@ -43,7 +52,7 @@ def normalize_openai_responses_request(
         messages.append({"role": "system", "content": instructions})
     messages.extend(_input_messages(endpoint, request.get("input"), transaction_id))
     final_request: JsonMutableObject = {"model": model, "messages": messages}
-    _copy_request_fields(request, final_request, endpoint, transaction_id)
+    _copy_request_fields(request, final_request)
     stream = request.get("stream") is True
     final_request["stream"] = stream
     return CanonicalRequestInput(endpoint, stream, model, final_request, final_request, request)
@@ -79,44 +88,35 @@ def _input_messages(
         fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "input")
     result: list[JsonMutableValue] = []
     for item in raw_input:
-        if not is_json_object(item):
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "input item")
-        result.append(_input_item(endpoint, item, transaction_id))
+        if is_json_object(item):
+            message = _input_item(item)
+            if message is not None:
+                result.append(message)
+    if not result:
+        fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "input")
     return result
 
 
-def _input_item(
-    endpoint: EligibleEndpoint, item: Mapping[str, JsonValue], transaction_id: str | None
-) -> JsonMutableValue:
+def _input_item(item: Mapping[str, JsonValue]) -> JsonMutableValue | None:
     item_type = item.get("type")
     match item_type:
         case "function_call_output":
             call_id = optional_string(item, "call_id")
             output = optional_string(item, "output")
             if call_id is None or output is None:
-                fail(
-                    endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "function_call_output"
-                )
+                return None
             return {"role": "tool", "tool_call_id": call_id, "content": output}
-        case None:
+        case None | "message":
             role = optional_string(item, "role")
-            if role is None:
-                fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "input.role")
-            content = text_content_from_openai(
-                endpoint, item.get("content"), transaction_id, input_prefix="input.content"
-            )
+            content = lenient_text_content_from_openai(item.get("content"))
+            if role is None or content is None:
+                return None
             return {"role": "system" if role == "developer" else role, "content": content}
-        case str():
-            fail(
-                endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, f"input item.type:{item_type}"
-            )
         case _:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "input item.type")
+            return None
 
 
-def _copy_request_fields(
-    request: JsonObject, final_request: JsonMutableObject, endpoint: EligibleEndpoint, transaction_id: str | None
-) -> None:
+def _copy_request_fields(request: JsonObject, final_request: JsonMutableObject) -> None:
     for key in ("tool_choice", "temperature", "top_p", "max_output_tokens"):
         if key in request:
             final_request[key] = json_mutable(request[key])
@@ -124,22 +124,23 @@ def _copy_request_fields(
         final_request["max_tokens"] = json_mutable(request["max_output_tokens"])
     tools = request.get("tools")
     if tools is not None:
-        final_request["tools"] = _tools(endpoint, tools, transaction_id)
+        final_request["tools"] = _tools(tools)
 
 
-def _tools(endpoint: EligibleEndpoint, tools: JsonValue, transaction_id: str | None) -> list[JsonMutableValue]:
+def _tools(tools: JsonValue) -> list[JsonMutableValue]:
     if not is_json_sequence(tools):
-        fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "tools")
+        return []
     result: list[JsonMutableValue] = []
     for tool in tools:
         if not is_json_object(tool) or tool.get("type") != "function":
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, "tool")
+            continue
         name = optional_string(tool, "name")
-        if name is None:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "tool.name")
+        parameters = tool.get("parameters")
+        if name is None or not is_json_object(parameters):
+            continue
         canonical: JsonMutableObject = {
             "name": name,
-            "input_schema": json_mutable_object(object_field(endpoint, tool, "parameters", transaction_id)),
+            "input_schema": json_mutable_object(parameters),
         }
         description = optional_string(tool, "description")
         if description is not None:
@@ -151,45 +152,38 @@ def _tools(endpoint: EligibleEndpoint, tools: JsonValue, transaction_id: str | N
 def _buffered_response(
     endpoint: EligibleEndpoint, response: JsonObject, transaction_id: str | None
 ) -> JsonMutableObject:
-    content: list[JsonMutableValue] = []
-    output = response.get("output")
-    if not is_json_sequence(output):
+    try:
+        parsed = parse_openai_response(response)
+    except ValidationError:
+        # The pinned openai SDK's strict Literals (e.g. Response.status) reject
+        # novel API values with an uncaught ValidationError; convert to a typed,
+        # retryable failure so a novel variant skips one transaction rather than
+        # wedging the backfill batch.
+        fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "response")
+    if not parsed.output:
         fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "output")
-    for item in output:
-        if not is_json_object(item):
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "output item")
-        content.extend(_output_item(endpoint, item, transaction_id))
-    final = _response_base(response, content)
-    _copy_status_fields(response, final)
+    content = [block for item in parsed.output for block in _output_item(endpoint, item, transaction_id)]
+    if not content:
+        fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "output content")
+    usage = canonical_usage(parsed.usage.model_dump() if parsed.usage is not None else None)
+    final = _response_base(parsed.id, parsed.model, usage, content)
+    _copy_status_fields(response, parsed.status, final)
     return final
 
 
 def _output_item(
-    endpoint: EligibleEndpoint, item: Mapping[str, JsonValue], transaction_id: str | None
+    endpoint: EligibleEndpoint,
+    item: ResponseOutputItem,
+    transaction_id: str | None,
 ) -> list[JsonMutableValue]:
-    match item.get("type"):
-        case "message":
-            content = item.get("content")
-            if not is_json_sequence(content):
-                fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "message.content")
-            blocks: list[JsonMutableValue] = []
-            for block in content:
-                if not is_json_object(block):
-                    fail(
-                        endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "message.content block"
-                    )
-                blocks.extend(_output_content(endpoint, block, transaction_id))
-            return blocks
-        case "function_call":
-            call_id = optional_string(item, "call_id")
-            name = optional_string(item, "name")
-            arguments = optional_string(item, "arguments") or "{}"
+    match item:
+        case ResponseOutputMessage(content=message_content):
+            return [block for part in message_content for block in _output_content(part)]
+        case ResponseFunctionToolCall(call_id=call_id, name=name, arguments=arguments):
             if not call_id:
                 fail(
                     endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "function_call.call_id"
                 )
-            if name is None:
-                fail(endpoint, transaction_id, PassthroughNormalizeReason.MISSING_REQUIRED_FIELD, "function_call.name")
             return [
                 {
                     "type": "tool_use",
@@ -199,25 +193,19 @@ def _output_item(
                 }
             ]
         case _:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, "output item")
+            return []
 
 
 def _output_content(
-    endpoint: EligibleEndpoint, block: Mapping[str, JsonValue], transaction_id: str | None
+    block: ResponseOutputText | ResponseOutputRefusal,
 ) -> list[JsonMutableValue]:
-    match block.get("type"):
-        case "output_text":
-            text = optional_string(block, "text")
-            if text is None:
-                fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "output_text")
+    match block:
+        case ResponseOutputText(text=text):
             return [{"type": "text", "text": text}]
-        case "refusal":
-            refusal = optional_string(block, "refusal")
-            if refusal is None:
-                fail(endpoint, transaction_id, PassthroughNormalizeReason.MALFORMED_PAYLOAD, "refusal")
+        case ResponseOutputRefusal(refusal=refusal):
             return [{"type": "text", "text": refusal}]
         case _:
-            fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, "output content")
+            return []
 
 
 def _stream_response(endpoint: EligibleEndpoint, response: JsonObject, transaction_id: str | None) -> JsonMutableObject:
@@ -225,29 +213,35 @@ def _stream_response(endpoint: EligibleEndpoint, response: JsonObject, transacti
     completed = folded.completed or {}
     if is_json_sequence(completed.get("output")):
         return _buffered_response(endpoint, completed, transaction_id)
-    final = _response_base(completed, [{"type": "text", "text": folded.text}])
-    _copy_status_fields(completed, final)
+    final = _response_base(
+        optional_string(completed, "id"),
+        optional_string(completed, "model"),
+        canonical_usage(completed.get("usage")),
+        [{"type": "text", "text": folded.text}],
+    )
+    _copy_status_fields(completed, optional_string(completed, "status"), final)
     return final
 
 
-def _response_base(response: JsonObject, content: list[JsonMutableValue]) -> JsonMutableObject:
+def _response_base(
+    response_id: str | None, model: str | None, usage: JsonMutableObject | None, content: list[JsonMutableValue]
+) -> JsonMutableObject:
     stop = (
         "tool_use" if any(is_json_object(item) and item.get("type") == "tool_use" for item in content) else "end_turn"
     )
     final: JsonMutableObject = {"role": "assistant", "content": content, "stop_reason": stop}
-    for key in ("id", "model"):
-        value = optional_string(response, key)
-        if value is not None:
-            final[key] = value
-    usage = canonical_usage(response.get("usage"))
+    if response_id is not None:
+        final["id"] = response_id
+    if model is not None:
+        final["model"] = model
     if usage is not None:
         final["usage"] = usage
     return final
 
 
-def _copy_status_fields(response: JsonObject, final: JsonMutableObject) -> None:
+def _copy_status_fields(response: JsonObject, status: str | None, final: JsonMutableObject) -> None:
     for key in ("status", "incomplete_details", "error"):
         if key in response:
             final[key] = json_mutable(response[key])
-    if response.get("status") in ("failed", "incomplete") or response.get("error") is not None:
+    if status in ("failed", "incomplete") or response.get("error") is not None:
         final["stop_reason"] = "error"

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from pydantic import ValidationError
+
 from luthien_proxy.passthrough_materialize.endpoints import EligibleEndpoint
 from luthien_proxy.passthrough_materialize.gemini_common import (
     gemini_content_free_parts,
@@ -31,6 +33,7 @@ from luthien_proxy.passthrough_materialize.payloads import (
     JsonMutableValue,
     JsonObject,
 )
+from luthien_proxy.passthrough_materialize.provider_models import parse_gemini_response
 
 
 def normalize_gemini_response(
@@ -50,7 +53,15 @@ def normalize_gemini_response(
     elif request_is_streaming:
         final_response = normalize_gemini_stream_response(endpoint, response, transaction_id)
     else:
-        final_response = _buffered_response(endpoint, response, transaction_id)
+        try:
+            source = parse_gemini_response(response).model_dump(mode="json", by_alias=True, exclude_none=True)
+        except ValidationError:
+            # Best-effort SDK: the google-genai response model is strict
+            # (extra='forbid') and lags the live REST API (e.g. it rejects
+            # usageMetadata.serviceTier); fall back to the raw payload, which
+            # _buffered_response maps leniently.
+            source = response
+        final_response = _buffered_response(endpoint, source, transaction_id)
     model = final_response.get("model")
     final_model = model if isinstance(model, str) else None
     return CanonicalResponseInput(endpoint, request_is_streaming, final_model, final_response, final_response, response)
@@ -152,14 +163,9 @@ def _candidate_parts(
                 result.append(gemini_function_call(endpoint, call, function_ordinal, transaction_id))
                 function_ordinal += 1
             case {"functionResponse": _}:
-                fail(
-                    endpoint,
-                    transaction_id,
-                    PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
-                    "candidate.part.functionResponse",
-                )
+                continue
             case _:
-                fail(endpoint, transaction_id, PassthroughNormalizeReason.UNSUPPORTED_VARIANT, "candidate.part")
+                continue
     return result
 
 

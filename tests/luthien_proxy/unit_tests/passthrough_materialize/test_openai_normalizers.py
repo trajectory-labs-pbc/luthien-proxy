@@ -212,7 +212,7 @@ def test_normalizes_upstream_http_error_when_openai_error_body_is_captured() -> 
                     }
                 ],
             },
-            PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
+            PassthroughNormalizeReason.MISSING_REQUIRED_FIELD,
         ),
     ],
 )
@@ -323,6 +323,32 @@ def test_normalizes_responses_buffered_response_when_output_status_function_and_
         "status": "completed",
         "usage": {"input_tokens": 7, "output_tokens": 4, "total_tokens": 11},
     }
+
+
+def test_responses_buffered_response_with_novel_status_raises_typed_error_not_uncaught() -> None:
+    # A future OpenAI Response.status the pinned SDK does not model must surface as a
+    # typed, retryable PassthroughNormalizeError (skips one transaction), NOT an uncaught
+    # pydantic ValidationError -- materialize.py and reconcile.py catch only typed/DB
+    # errors, so an uncaught ValidationError would wedge the whole backfill batch.
+    response = {
+        "id": "resp_1",
+        "model": "gpt-4.1",
+        "status": "a_future_status_the_pinned_sdk_does_not_know",
+        "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
+        ],
+    }
+
+    with pytest.raises(PassthroughNormalizeError) as exc_info:
+        normalize_openai_responses_response(
+            _responses_endpoint(),
+            response,
+            request_is_streaming=False,
+            http_status=200,
+            transaction_id="txn_novel_status",
+        )
+
+    assert exc_info.value.detail == "response"
 
 
 def test_normalizes_responses_stream_response_when_events_fold_to_final_message() -> None:
@@ -574,8 +600,8 @@ def test_responses_unknown_variants_report_precise_typed_details() -> None:
             transaction_id="txn_unknown_event",
         )
 
-    assert input_exc.value.reason == PassthroughNormalizeReason.UNSUPPORTED_VARIANT
-    assert input_exc.value.detail == "input item.type:web_search_call"
+    assert input_exc.value.reason == PassthroughNormalizeReason.MISSING_REQUIRED_FIELD
+    assert input_exc.value.detail == "input"
     assert event_exc.value.reason == PassthroughNormalizeReason.UNSUPPORTED_VARIANT
     assert event_exc.value.detail == "stream event.type:response.unexpected"
 
@@ -603,11 +629,11 @@ def test_usage_zero_counts_and_unknown_finish_reasons_do_not_leak_raw_values() -
     [
         (
             {"model": "gpt-4.1", "input": [{"role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]},
-            PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
+            PassthroughNormalizeReason.MISSING_REQUIRED_FIELD,
         ),
         (
             {"id": "resp_3", "model": "gpt-4.1", "output": [{"type": "web_search_call"}]},
-            PassthroughNormalizeReason.UNSUPPORTED_VARIANT,
+            PassthroughNormalizeReason.MISSING_REQUIRED_FIELD,
         ),
     ],
 )
@@ -626,3 +652,97 @@ def test_responses_payload_raises_typed_error_when_sub_shape_is_unknown(
 
     assert exc_info.value.reason == reason
     assert exc_info.value.endpoint_kind == EndpointKind.OPENAI_RESPONSES
+
+
+def test_chat_reasoning_tokens_lift_from_completion_tokens_details_into_canonical_usage() -> None:
+    # Given: an OpenAI Chat Completions response for a reasoning model. OpenAI nests the
+    # reasoning token count under `usage.completion_tokens_details.reasoning_tokens` -
+    # `output_tokens` still counts them, but we surface `reasoning_tokens` separately so
+    # downstream consumers can distinguish reasoning from visible output.
+    response = {
+        "id": "chatcmpl_reasoning",
+        "model": "gpt-5.6-sol",
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "visible"}}],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 8,
+            "total_tokens": 20,
+            "completion_tokens_details": {"reasoning_tokens": 6},
+        },
+    }
+
+    payload = build_response_event_payload(
+        normalize_openai_chat_response(
+            _chat_endpoint(),
+            response,
+            request_is_streaming=False,
+            http_status=200,
+            transaction_id="txn_chat_reasoning",
+        )
+    )
+
+    assert payload["final_response"]["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 8,
+        "total_tokens": 20,
+        "reasoning_tokens": 6,
+    }
+
+
+def test_responses_reasoning_tokens_lift_from_output_tokens_details_into_canonical_usage() -> None:
+    # Given: an OpenAI Responses API response for a reasoning model. Responses nests the
+    # reasoning token count under `usage.output_tokens_details.reasoning_tokens`.
+    response = {
+        "id": "resp_reasoning",
+        "model": "gpt-5.6-sol",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "visible"}]}],
+        "usage": {
+            "input_tokens": 14,
+            "output_tokens": 9,
+            "total_tokens": 23,
+            "output_tokens_details": {"reasoning_tokens": 7},
+        },
+    }
+
+    payload = build_response_event_payload(
+        normalize_openai_responses_response(
+            _responses_endpoint(),
+            response,
+            request_is_streaming=False,
+            http_status=200,
+            transaction_id="txn_responses_reasoning",
+        )
+    )
+
+    assert payload["final_response"]["usage"] == {
+        "input_tokens": 14,
+        "output_tokens": 9,
+        "total_tokens": 23,
+        "reasoning_tokens": 7,
+    }
+
+
+def test_chat_content_filter_finish_reason_maps_to_safety_not_end_turn() -> None:
+    # Given: OpenAI's `content_filter` finish_reason indicates a safety-policy block, NOT
+    # a normal completion. Previously we collapsed it to `end_turn`, making it
+    # indistinguishable from a natural stop. Now it maps to `safety` (matching the Gemini
+    # normalizer's SAFETY bucket) so downstream consumers can filter blocked completions.
+    response = {
+        "id": "chatcmpl_blocked",
+        "model": "gpt-4.1",
+        "choices": [{"finish_reason": "content_filter", "message": {"role": "assistant", "content": ""}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5},
+    }
+
+    payload = build_response_event_payload(
+        normalize_openai_chat_response(
+            _chat_endpoint(),
+            response,
+            request_is_streaming=False,
+            http_status=200,
+            transaction_id="txn_content_filter",
+        )
+    )
+
+    assert payload["final_response"]["stop_reason"] == "safety"

@@ -7,19 +7,18 @@ import logging
 from collections.abc import Iterator
 from unittest.mock import Mock, patch
 
-import pytest
-from opentelemetry import metrics
 import opentelemetry.metrics._internal as metrics_internal
-from opentelemetry import trace
+import pytest
+from opentelemetry import metrics, trace
 from opentelemetry.context import Context
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
     OTLPSpanExporter as GrpcSpanExporter,
 )
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as HttpSpanExporter,
 )
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from luthien_proxy import telemetry
 from luthien_proxy.settings import Settings

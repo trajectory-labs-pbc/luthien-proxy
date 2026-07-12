@@ -22,10 +22,10 @@ from typing import Final
 
 from opentelemetry import metrics, trace
 from opentelemetry.context import Context, attach, detach
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
     OTLPSpanExporter as GrpcSpanExporter,
 )
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as HttpSpanExporter,
 )
@@ -152,7 +152,9 @@ def configure_tracing() -> trace.Tracer:
     Returns:
         Configured tracer for manual instrumentation
     """
-    otel_enabled, otel_endpoint, _metrics_endpoint, service_name, service_version, environment, protocol = _get_otel_config()
+    otel_enabled, otel_endpoint, _metrics_endpoint, service_name, service_version, environment, protocol = (
+        _get_otel_config()
+    )
 
     if not otel_enabled:
         logger.debug("OpenTelemetry disabled (OTEL_ENABLED=false)")
@@ -181,7 +183,10 @@ def configure_tracing() -> trace.Tracer:
 
 
 def configure_metrics() -> None:
-    otel_enabled, _otel_endpoint, metrics_endpoint, service_name, service_version, environment, _protocol = _get_otel_config()
+    """Configure OpenTelemetry metric export when enabled."""
+    otel_enabled, _otel_endpoint, metrics_endpoint, service_name, service_version, environment, _protocol = (
+        _get_otel_config()
+    )
 
     if not otel_enabled or not metrics_endpoint:
         logger.debug("OpenTelemetry metrics disabled")

@@ -138,8 +138,9 @@ async def _stream_with_keepalive(
     source: AsyncIterator[AnthropicPolicyEmission],
     interval_seconds: float,
 ) -> AsyncIterator["AnthropicPolicyEmission | _Keepalive"]:
-    """Yield items from `source`, injecting a `_KEEPALIVE` sentinel whenever the
-    next item takes longer than `interval_seconds` to arrive.
+    """Yield items from `source`, injecting a `_KEEPALIVE` sentinel.
+
+    It is emitted whenever the next item takes longer than `interval_seconds` to arrive.
 
     The in-flight `__anext__` is shielded from the per-wait timeout, so a slow item
     is never dropped: the timeout only triggers a keepalive and we keep waiting on
