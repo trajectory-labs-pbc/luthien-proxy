@@ -285,6 +285,7 @@ class RequestLogRecorder:
                         body_truncated = body_truncated or body_sizes.body_truncated
             except DatabaseWriteError as exc:
                 span.set_status(Status(StatusCode.ERROR, "db write failed"))
+                span.record_exception(exc)
                 RequestLogRecorder.dropped_writes += 1
                 logger.warning(
                     "Failed to write request logs for %s (%d total dropped): %s",
