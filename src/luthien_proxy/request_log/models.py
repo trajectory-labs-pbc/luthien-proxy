@@ -37,14 +37,30 @@ class _PendingLog:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SerializedBody:
+    payload: str | None
+    size_bytes: int
+    truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _SerializedLogBodySizes:
+    request_body_bytes: int
+    response_body_bytes: int
+    body_truncated: bool
+
+
 async def insert_log_row(
     conn: ConnectionProtocol,
     pending: _PendingLog,
-    serialize_body: Callable[[dict[str, Any] | None], str | None],
-) -> None:
+    serialize_body: Callable[[dict[str, Any] | None], _SerializedBody],
+) -> _SerializedLogBodySizes:
     """Insert one request_logs row, wrapping driver errors for callers."""
     # SQL avoids the CASE WHEN $N ... $N duplicate-positional pattern (breaks SQLite ?);
     # to_timestamp(NULL) -> NULL on both Postgres and SQLite.
+    request_body = serialize_body(pending.request_body)
+    response_body = serialize_body(pending.response_body)
     try:
         await conn.execute(
             """
@@ -69,10 +85,10 @@ async def insert_log_row(
             pending.http_method,
             pending.url,
             json.dumps(pending.request_headers) if pending.request_headers else None,
-            serialize_body(pending.request_body),
+            request_body.payload,
             pending.response_status,
             json.dumps(pending.response_headers) if pending.response_headers else None,
-            serialize_body(pending.response_body),
+            response_body.payload,
             pending.started_at,
             pending.completed_at,
             pending.duration_ms,
@@ -87,6 +103,12 @@ async def insert_log_row(
             f"transaction_id={pending.transaction_id!r}): {exc}",
             cause=exc,
         ) from exc
+
+    return _SerializedLogBodySizes(
+        request_body_bytes=request_body.size_bytes,
+        response_body_bytes=response_body.size_bytes,
+        body_truncated=request_body.truncated or response_body.truncated,
+    )
 
 
 class RequestLogEntry(BaseModel):

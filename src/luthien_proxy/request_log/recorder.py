@@ -17,13 +17,12 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 
 from opentelemetry import metrics, trace
 from opentelemetry.trace import Status, StatusCode
 
-from luthien_proxy.request_log.models import _PendingLog, insert_log_row
+from luthien_proxy.request_log.models import _PendingLog, _SerializedBody, insert_log_row
 from luthien_proxy.request_log.sanitize import sanitize_headers
 from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
 
@@ -49,13 +48,6 @@ def _log_task_exception(task: asyncio.Task[None]) -> None:
     """Surface exceptions from fire-and-forget background tasks."""
     if not task.cancelled() and task.exception() is not None:
         logger.error("Background request log write failed", exc_info=task.exception())
-
-
-@dataclass(frozen=True, slots=True)
-class _SerializedBody:
-    payload: str | None
-    size_bytes: int
-    truncated: bool
 
 
 class RequestLogRecorder:
