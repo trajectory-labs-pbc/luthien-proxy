@@ -81,6 +81,7 @@ class Settings(_SettingsBase):
 
     # ── observability ───────────────────────────────────────────────
     otel_enabled: bool = False
+    observability_stdout_enabled: bool = True
     otel_exporter_otlp_endpoint: str = "http://tempo:4318/v1/traces"
     otel_exporter_otlp_metrics_endpoint: str = "http://tempo:4318/v1/metrics"
     otel_exporter_otlp_protocol: str = "http/protobuf"

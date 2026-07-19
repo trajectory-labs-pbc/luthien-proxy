@@ -57,6 +57,7 @@ from luthien_proxy.telemetry import (
     configure_metrics,
     configure_tracing,
     instrument_app,
+    instrument_db,
     instrument_redis,
 )
 from luthien_proxy.ui import router as ui_router
@@ -81,6 +82,7 @@ configure_tracing()
 configure_metrics()
 configure_logging()
 instrument_redis()
+instrument_db()
 
 init_sentry()
 
@@ -213,7 +215,7 @@ def create_app(
         _emitter = EventEmitter(
             db_pool=db_pool,
             event_publisher=_event_publisher,
-            stdout_enabled=True,
+            stdout_enabled=get_settings().observability_stdout_enabled,
         )
         logger.info("Event emitter created")
 

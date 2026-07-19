@@ -212,6 +212,7 @@ class RequestLogRecorder:
                 write_succeeded = True
             except DatabaseWriteError as exc:
                 span.set_status(Status(StatusCode.ERROR, "db write failed"))
+                span.record_exception(exc)
                 RequestLogRecorder.dropped_writes += 1
                 db_request_log_dropped_counter.add(1)
                 logger.warning(
