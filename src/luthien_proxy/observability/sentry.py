@@ -142,6 +142,12 @@ def init_sentry(settings: Settings | None = None) -> None:
     # OTel exporter logs at ERROR when Tempo is unreachable — expected in
     # local dev without Docker. Don't let these burn Sentry quota.
     ignore_logger("opentelemetry.sdk.trace.export")
+    # OTel swallows context-detach failures itself ("Failed to detach context",
+    # a ValueError on cross-task token resets during streaming) and the request
+    # is unaffected. Captured through the logging integration this fired on
+    # ~every proxied request (~86k events in 13h on 2026-08-05) and exhausted
+    # the org error quota. Pure log noise — never send it.
+    ignore_logger("opentelemetry.context")
 
     sentry_sdk.init(
         dsn=settings.sentry_dsn,
