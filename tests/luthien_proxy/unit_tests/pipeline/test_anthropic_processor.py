@@ -2,9 +2,13 @@
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import logging
+import time
+from collections.abc import AsyncIterator, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import opentelemetry.metrics._internal as metrics_internal
 import pytest
 from anthropic import APIConnectionError as AnthropicConnectionError
 from anthropic import APIStatusError as AnthropicStatusError
@@ -16,19 +20,30 @@ from anthropic.types import (
     RawMessageDeltaEvent,
     RawMessageStartEvent,
     RawMessageStopEvent,
+    SignatureDelta,
     TextDelta,
+    ThinkingDelta,
 )
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from httpx import Request as HttpxRequest
 from httpx import Response as HttpxResponse
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from tests.constants import DEFAULT_TEST_MODEL
 from tests.luthien_proxy.fixtures.policy_context import make_policy_context
 
 from luthien_proxy.credentials import Credential, CredentialType
 from luthien_proxy.exceptions import BackendAPIError
+from luthien_proxy.llm.anthropic_client import AnthropicUpstreamTransportError
 from luthien_proxy.llm.types.anthropic import AnthropicRequest, AnthropicResponse, build_usage
+from luthien_proxy.pipeline import anthropic_processor as anthropic_processor_mod
 from luthien_proxy.pipeline.anthropic_processor import (
     _AnthropicPolicyIO,
     _build_error_event,
@@ -44,6 +59,60 @@ from luthien_proxy.policy_core.anthropic_execution_interface import (
     AnthropicPolicyEmission,
 )
 from luthien_proxy.policy_core.policy_context import PolicyContext
+
+
+def _metric_point(reader: InMemoryMetricReader, metric_name: str):
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    return metric.data.data_points[0]
+    raise AssertionError(f"metric {metric_name!r} was not recorded")
+
+
+@pytest.fixture
+def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    """Route `anthropic_processor`'s module-level tracer to an in-memory exporter."""
+    previous_provider = trace._TRACER_PROVIDER
+    previous_once_done = trace._TRACER_PROVIDER_SET_ONCE._done
+    trace._TRACER_PROVIDER_SET_ONCE._done = False
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    monkeypatch.setattr(
+        anthropic_processor_mod,
+        "tracer",
+        provider.get_tracer(anthropic_processor_mod.__name__),
+    )
+
+    try:
+        yield exporter
+    finally:
+        provider.shutdown()
+        trace._TRACER_PROVIDER = previous_provider
+        trace._TRACER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class TestFormatSSEEvent:
@@ -133,6 +202,35 @@ class TestFormatSSEEvent:
         data = json.loads(result.split("data: ", 1)[1].strip())
         assert data["new_api_field"] == 42
         assert data["type"] == "content_block_delta"
+
+    def test_serializes_container_expires_at_datetime(self):
+        """message_start events carry message.container.expires_at as a datetime
+        when the response used the code-execution tool. model_dump() in python
+        mode leaves it as a datetime object, which json.dumps rejects — killing
+        live streams mid-flight with TypeError('Object of type datetime is not
+        JSON serializable'). Every emitted value must be JSON-serializable."""
+        event = RawMessageStartEvent.model_validate(
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_123",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": DEFAULT_TEST_MODEL,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                    "container": {"id": "container_abc", "expires_at": "2026-08-12T11:14:56Z"},
+                },
+            }
+        )
+        result = _format_sse_event(event)
+
+        data = json.loads(result.split("data: ", 1)[1].strip())
+        expires_at = data["message"]["container"]["expires_at"]
+        assert isinstance(expires_at, str)
+        assert expires_at.startswith("2026-08-12T11:14:56")
 
 
 class TestProcessRequest:
@@ -316,11 +414,25 @@ class TestProcessRequest:
         assert "payload too large" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_malformed_json_returns_400(self, mock_request, mock_emitter, mock_span):
-        """Test that malformed JSON in request body returns 400 error."""
+    async def test_malformed_json_returns_400_and_logs_at_error(self, mock_request, mock_emitter, mock_span, caplog):
+        """Malformed-JSON handling returns 400 AND must log at ERROR, never WARNING.
+
+        Pins the contract with Datadog monitor 21915707
+        (`meta/infra/pulumi/components/datadog/luthien_error_monitor.py`), which pages on a
+        single non-OTEL ERROR line: `logs("service:luthien-proxy env:production status:error
+        -@logger:opentelemetry.*").index("*").rollup("count").last("5m") > 0`, critical="0".
+        This is the ONLY alert for this failure class. It was downgraded to WARNING in
+        fix/sentry-expected-client-and-network-noise (to cut Sentry noise, LUTHIEN-7/9) and
+        restored here: if it drifts back to WARNING, a serialization regression that 400s
+        every sample goes completely silent — no Datadog page, and no Sentry event either
+        (Sentry's LoggingIntegration only captures at ERROR by default).
+        """
         mock_request.json = AsyncMock(side_effect=json.JSONDecodeError("Expecting value", "", 0))
 
-        with patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer:
+        with (
+            patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer,
+            caplog.at_level(logging.WARNING, logger="luthien_proxy.pipeline.anthropic_processor"),
+        ):
             mock_tracer.start_as_current_span.return_value.__enter__ = MagicMock(return_value=mock_span)
             mock_tracer.start_as_current_span.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -333,6 +445,9 @@ class TestProcessRequest:
 
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid JSON in request body"
+        malformed_json_records = [r for r in caplog.records if "Malformed JSON" in r.message]
+        assert malformed_json_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in malformed_json_records)
 
     @pytest.mark.asyncio
     async def test_missing_model_returns_400(self, mock_request, mock_emitter, mock_span):
@@ -923,6 +1038,51 @@ class TestBuildErrorEvent:
         assert event.get("error", {}).get("type") == "api_connection_error"
         assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
 
+    def test_builds_transport_error_event_and_logs_at_error(self, caplog):
+        """AnthropicUpstreamTransportError — raised by AnthropicClient when the
+        actual upstream connection drops mid-stream — is the backend's network, not a proxy
+        defect (LUTHIEN-A/B/G), but it MUST still log at ERROR, not WARNING.
+
+        Pins the contract with Datadog monitor 21915707
+        (`meta/infra/pulumi/components/datadog/luthien_error_monitor.py`), which pages on a
+        single non-OTEL ERROR line: `logs("service:luthien-proxy env:production status:error
+        -@logger:opentelemetry.*").index("*").rollup("count").last("5m") > 0`, critical="0".
+        This is the ONLY alert for this failure class. It was downgraded to WARNING in
+        fix/sentry-expected-client-and-network-noise and restored here: if it drifts back to
+        WARNING, upstream transport failures go completely silent — no Datadog page, and no
+        Sentry event either (Sentry's LoggingIntegration only captures at ERROR by default).
+        """
+        error = AnthropicUpstreamTransportError(
+            "peer closed connection without sending complete message body (incomplete chunked read)"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="luthien_proxy.pipeline.anthropic_processor"):
+            event = _build_error_event(error, "test-call-id")
+
+        assert event.get("type") == "error"
+        assert event.get("error", {}).get("type") == "api_connection_error"
+        assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
+        transport_records = [r for r in caplog.records if "Mid-stream transport error" in r.message]
+        assert transport_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in transport_records)
+
+    def test_builds_generic_error_event_for_policy_origin_transport_error(self, caplog):
+        """A raw httpx.TransportError NOT raised by AnthropicClient (e.g. from a
+        policy's own outbound HTTP call) is not AnthropicUpstreamTransportError,
+        so it must stay on the generic error-level path — the upstream-network
+        carve-out must not swallow a policy/gateway bug (thermonuclear-deep-review
+        finding on PR #814)."""
+        mock_request = HttpxRequest("POST", "https://example.com/judge")
+        error = httpx.RemoteProtocolError("peer closed connection", request=mock_request)
+
+        with caplog.at_level(logging.ERROR, logger="luthien_proxy.pipeline.anthropic_processor"):
+            event = _build_error_event(error, "test-call-id")
+
+        assert event.get("error", {}).get("type") == "api_error"
+        error_records = [r for r in caplog.records if "Mid-stream error" in r.message]
+        assert error_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in error_records)
+
     def test_builds_generic_error_event(self):
         """Generic exceptions produce a sanitized error event — internal details are not forwarded."""
         error = RuntimeError("Something went wrong")
@@ -932,6 +1092,18 @@ class TestBuildErrorEvent:
         assert event.get("type") == "error"
         assert event.get("error", {}).get("type") == "api_error"
         assert event.get("error", {}).get("message") == "An internal error occurred while processing the request."
+
+    def test_builds_generic_error_event_logs_at_error(self, caplog):
+        """A genuine proxy bug mid-stream must still be error-level and visible —
+        the httpx.TransportError carve-out must not swallow real defects."""
+        error = RuntimeError("Something went wrong")
+
+        with caplog.at_level(logging.ERROR, logger="luthien_proxy.pipeline.anthropic_processor"):
+            _build_error_event(error, "test-call-id")
+
+        error_records = [r for r in caplog.records if "Mid-stream error" in r.message]
+        assert error_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in error_records)
 
 
 class TestMidStreamErrorHandling:
@@ -1176,6 +1348,20 @@ class TestHandleAnthropicError:
     def test_connection_error_raises_backend_api_error(self):
         """Connection errors should raise BackendAPIError with 502."""
         exc = AnthropicConnectionError(request=HttpxRequest("POST", "https://api.anthropic.com/v1/messages"))
+
+        with pytest.raises(BackendAPIError) as exc_info:
+            _handle_anthropic_error(exc, "test-call")
+
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_type == "api_connection_error"
+
+    def test_upstream_transport_error_raises_backend_api_error(self):
+        """AnthropicUpstreamTransportError (raised by AnthropicClient when the
+        actual upstream connection drops) should raise BackendAPIError with 502
+        — previously this exception type wasn't classified at all in the
+        non-streaming path and propagated as an unclassified 500
+        (thermonuclear-deep-review finding on PR #814)."""
+        exc = AnthropicUpstreamTransportError("peer closed connection")
 
         with pytest.raises(BackendAPIError) as exc_info:
             _handle_anthropic_error(exc, "test-call")
@@ -1795,6 +1981,93 @@ class TestReconstructResponseFromStreamEvents:
 
         assert result is not None
         assert result["usage"]["cache_read_input_tokens"] == 75
+
+    def test_captures_thinking_text_and_signature(self):
+        """A streamed thinking block lands in history with its text and signature.
+
+        Without this, a reasoning-extraction session captured through the proxy has no
+        same-run ground truth: the response looks healthy but carries no trace.
+        """
+        events = [
+            self._message_start("msg_think", input_tokens=7),
+            RawContentBlockStartEvent(
+                type="content_block_start",
+                index=0,
+                content_block={"type": "thinking", "thinking": "", "signature": ""},
+            ),
+            RawContentBlockDeltaEvent(
+                type="content_block_delta", index=0, delta=ThinkingDelta(type="thinking_delta", thinking="step one")
+            ),
+            RawContentBlockDeltaEvent(
+                type="content_block_delta", index=0, delta=ThinkingDelta(type="thinking_delta", thinking=" step two")
+            ),
+            RawContentBlockDeltaEvent(
+                type="content_block_delta", index=0, delta=SignatureDelta(type="signature_delta", signature="SIGVALUE")
+            ),
+            RawContentBlockStopEvent(type="content_block_stop", index=0),
+            RawMessageDeltaEvent(
+                type="message_delta",
+                delta={"stop_reason": "end_turn", "stop_sequence": None},
+                usage={"output_tokens": 4},
+            ),
+            RawMessageStopEvent(type="message_stop"),
+        ]
+
+        result = _reconstruct_response_from_stream_events(events)
+
+        assert result is not None
+        assert len(result["content"]) == 1
+        assert result["content"][0]["type"] == "thinking"
+        assert result["content"][0]["thinking"] == "step one step two"
+        assert result["content"][0]["signature"] == "SIGVALUE"
+
+    def test_preserves_thinking_before_text_in_block_order(self):
+        """Reasoning blocks keep their index order ahead of the visible answer."""
+        events = [
+            self._message_start(),
+            RawContentBlockStartEvent(
+                type="content_block_start",
+                index=0,
+                content_block={"type": "thinking", "thinking": "", "signature": ""},
+            ),
+            RawContentBlockDeltaEvent(
+                type="content_block_delta", index=0, delta=ThinkingDelta(type="thinking_delta", thinking="reasoned")
+            ),
+            RawContentBlockStopEvent(type="content_block_stop", index=0),
+            RawContentBlockStartEvent(type="content_block_start", index=1, content_block={"type": "text", "text": ""}),
+            RawContentBlockDeltaEvent(
+                type="content_block_delta", index=1, delta=TextDelta(type="text_delta", text="answer")
+            ),
+            RawContentBlockStopEvent(type="content_block_stop", index=1),
+            RawMessageStopEvent(type="message_stop"),
+        ]
+
+        result = _reconstruct_response_from_stream_events(events)
+
+        assert result is not None
+        assert [block["type"] for block in result["content"]] == ["thinking", "text"]
+        assert result["content"][0]["thinking"] == "reasoned"
+        assert result["content"][1]["text"] == "answer"
+
+    def test_captures_redacted_thinking_payload(self):
+        """A redacted_thinking block keeps its opaque data rather than vanishing."""
+        events = [
+            self._message_start(),
+            RawContentBlockStartEvent(
+                type="content_block_start",
+                index=0,
+                content_block={"type": "redacted_thinking", "data": "OPAQUEPAYLOAD"},
+            ),
+            RawContentBlockStopEvent(type="content_block_stop", index=0),
+            RawMessageStopEvent(type="message_stop"),
+        ]
+
+        result = _reconstruct_response_from_stream_events(events)
+
+        assert result is not None
+        assert len(result["content"]) == 1
+        assert result["content"][0]["type"] == "redacted_thinking"
+        assert result["content"][0]["data"] == "OPAQUEPAYLOAD"
 
 
 class TestBuildUsage:
@@ -2444,6 +2717,64 @@ class TestStreamingWebhookGate:
         assert kwargs["is_streaming"] is True
 
     @pytest.mark.asyncio
+    async def test_first_stream_event_sets_span_attribute(
+        self,
+        span_exporter: InMemorySpanExporter,
+    ):
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        async def emissions():
+            yield self._make_event()
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-first-event",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            request_start_time=time.monotonic() - 0.01,
+        )
+
+        await self._drain(response)
+
+        spans = {span.name: span for span in span_exporter.get_finished_spans()}
+        attrs = spans["process_response"].attributes
+        assert attrs is not None
+        assert isinstance(attrs["luthien.stream.first_event_ms"], int)
+        assert attrs["luthien.stream.first_event_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_first_stream_event_records_histogram(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ):
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        async def emissions():
+            yield self._make_event()
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-first-event-metric",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            request_start_time=time.monotonic() - 0.01,
+        )
+
+        await self._drain(response)
+
+        point = _metric_point(metric_reader, "luthien.stream.first_event_ms")
+        assert point.count == 1
+        assert point.sum >= 0
+
+    @pytest.mark.asyncio
     async def test_mid_stream_exception_fires_with_success_false(self):
         """Policy raises mid-stream → webhook fires with success=False, http_status=500."""
         from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
@@ -2474,6 +2805,57 @@ class TestStreamingWebhookGate:
         kwargs = webhook.fire_and_forget.call_args.kwargs
         assert kwargs["success"] is False
         assert kwargs["http_status"] == 500
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_upstream_transport_error_fires_with_503(self):
+        """AnthropicUpstreamTransportError mid-stream → error event classified as
+        api_connection_error, webhook AND request-log status 503 — the same
+        upstream-network bucket as AnthropicConnectionError, not a proxy 500.
+
+        Regression for the finding that this exception type fell through to
+        the generic `else: final_status = 500` branch, misclassifying an
+        Anthropic-side network outage as a proxy bug in the completion
+        webhook and request-log rows.
+        """
+        from luthien_proxy.llm.anthropic_client import AnthropicUpstreamTransportError
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        transport_error = AnthropicUpstreamTransportError("peer closed connection without sending complete message")
+
+        async def emissions():
+            yield self._make_event()
+            raise transport_error
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        webhook = MagicMock()
+        webhook.enabled = True
+        webhook.fire_and_forget = MagicMock()
+
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-transport-error",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            webhook_sender=webhook,
+            request_start_time=0.0,
+        )
+        chunks = await self._drain(response)
+
+        # Emitted error event is classified as api_connection_error (_build_error_event).
+        body_text = b"".join(chunks).decode()
+        assert "event: error" in body_text
+        assert '"type": "api_connection_error"' in body_text
+
+        # Webhook AND request-log both record the upstream-network status, not 500.
+        webhook.fire_and_forget.assert_called_once()
+        kwargs = webhook.fire_and_forget.call_args.kwargs
+        assert kwargs["success"] is False
+        assert kwargs["http_status"] == 503
+        recorder.record_inbound_response.assert_called_once_with(status=503)
+        recorder.record_outbound_response.assert_called_once_with(status=503)
 
     @pytest.mark.asyncio
     async def test_empty_stream_fires_with_success_false_500(self):
@@ -2981,3 +3363,136 @@ class TestWebhookFireIsolation:
 
         webhook.fire_and_forget.assert_called_once()
         recorder.flush.assert_called()  # cleanup completed despite webhook failure
+
+
+class TestStreamWithKeepalive:
+    """`_stream_with_keepalive` injects SSE keepalives during upstream gaps without
+    dropping or reordering real events. Regression: the Anthropic SDK drops upstream
+    `ping` events, so a long silent generation idled out at the ALB timeout."""
+
+    async def test_injects_keepalive_during_gap(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        async def source():
+            yield "A"
+            await asyncio.sleep(0.12)  # > interval -> keepalives expected in this gap
+            yield "B"
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+        reals = [x for x in out if not isinstance(x, _Keepalive)]
+        keepalives = [x for x in out if isinstance(x, _Keepalive)]
+        assert reals == ["A", "B"]  # order preserved, nothing dropped
+        assert len(keepalives) >= 1  # the gap produced at least one keepalive
+        assert out[0] == "A" and out[-1] == "B"  # keepalives sit between real events
+
+    async def test_no_keepalive_when_fast(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        async def source():
+            yield "A"
+            yield "B"
+            yield "C"
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.5)]
+        assert out == ["A", "B", "C"]
+        assert not any(isinstance(x, _Keepalive) for x in out)
+
+    async def test_empty_source_terminates(self):
+        from luthien_proxy.pipeline.anthropic_processor import _stream_with_keepalive
+
+        async def source():
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+        assert out == []
+
+    async def test_close_cancels_pending(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        cancelled = asyncio.Event()
+
+        async def source():
+            yield "A"
+            try:
+                await asyncio.sleep(10)  # long-pending item, in flight at close
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            yield "B"  # pragma: no cover - never reached
+
+        gen = _stream_with_keepalive(source(), 0.02)
+        assert await gen.__anext__() == "A"
+        nxt = await gen.__anext__()  # pending sleep in flight -> keepalive
+        assert isinstance(nxt, _Keepalive)
+        await gen.aclose()  # must cancel the pending __anext__, not hang
+        await asyncio.sleep(0.01)
+        assert cancelled.is_set()
+
+    async def test_source_exception_propagates(self):
+        """An exception raised by `source` surfaces to the consumer, not just a hang.
+
+        `_pump_to_queue` catches it and hands it back through the queue as a
+        `_StreamError` sentinel; `_stream_with_keepalive` must unwrap and re-raise it.
+        """
+        from luthien_proxy.pipeline.anthropic_processor import _stream_with_keepalive
+
+        async def source():
+            yield "A"
+            raise RuntimeError("upstream exploded")
+
+        gen = _stream_with_keepalive(source(), 0.02)
+        assert await gen.__anext__() == "A"
+        with pytest.raises(RuntimeError, match="upstream exploded"):
+            await gen.__anext__()
+
+    async def test_span_spanning_multiple_yields_detaches_cleanly(
+        self,
+        span_exporter: InMemorySpanExporter,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Regression for the production `Failed to detach context` ERROR storm.
+
+        `AnthropicClient.stream()` and `_AnthropicPolicyIO._stream()` each hold a
+        span open across every chunk of the upstream response — exactly this
+        shape, reproduced directly against `_stream_with_keepalive` instead of the
+        full pipeline. A keepalive gap forces at least one wait-for-timeout cycle
+        mid-span, which used to move the underlying generator's `__anext__` onto a
+        fresh `asyncio.Task` (and therefore a fresh `contextvars.Context`) on every
+        item, so the span's `__exit__` detached a token created in a different
+        Context than the one it ran in. That raised `ValueError` inside
+        `opentelemetry.context.detach()`, which logs it rather than propagating it
+        — so the only observable symptom is the ERROR log line asserted against
+        below.
+        """
+        from luthien_proxy.pipeline import anthropic_processor as mod
+        from luthien_proxy.pipeline.anthropic_processor import _Keepalive, _stream_with_keepalive
+
+        async def source():
+            with mod.tracer.start_as_current_span("fake_upstream"):
+                yield "A"
+                await asyncio.sleep(0.12)  # > interval -> forces a keepalive mid-span
+                yield "B"
+
+        with caplog.at_level(logging.ERROR, logger="opentelemetry.context"):
+            out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+
+        reals = [x for x in out if not isinstance(x, _Keepalive)]
+        assert reals == ["A", "B"]
+
+        failed_detaches = [r for r in caplog.records if "Failed to detach context" in r.message]
+        assert failed_detaches == []
+
+        finished = span_exporter.get_finished_spans()
+        assert len(finished) == 1
+        assert finished[0].name == "fake_upstream"
+        assert finished[0].status.status_code == StatusCode.UNSET
