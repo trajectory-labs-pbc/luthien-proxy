@@ -2,15 +2,26 @@
 
 import asyncio
 import json
+import logging
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import asyncpg
+import opentelemetry.metrics._internal as metrics_internal
 import pytest
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
 
+from luthien_proxy.observability import emitter as emitter_mod
 from luthien_proxy.observability.emitter import (
     EventEmitter,
     NullEventEmitter,
@@ -27,11 +38,60 @@ def _add_transaction_cm(mock_conn: AsyncMock) -> AsyncMock:
     """
 
     @asynccontextmanager
-    async def _txn() -> Any:
+    async def _txn() -> AsyncIterator[Any]:
         yield
 
     mock_conn.transaction = _txn
     return mock_conn
+
+
+def _metric_point(reader: InMemoryMetricReader, metric_name: str):
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    return metric.data.data_points[0]
+    raise AssertionError(f"metric {metric_name!r} was not recorded")
+
+
+@pytest.fixture
+def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    previous_provider = trace._TRACER_PROVIDER
+    previous_once_done = trace._TRACER_PROVIDER_SET_ONCE._done
+    trace._TRACER_PROVIDER_SET_ONCE._done = False
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    monkeypatch.setattr(emitter_mod, "tracer", provider.get_tracer(emitter_mod.__name__), raising=False)
+
+    try:
+        yield exporter
+    finally:
+        provider.shutdown()
+        trace._TRACER_PROVIDER = previous_provider
+        trace._TRACER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class TestSafeSerialize:
@@ -275,6 +335,27 @@ class TestEventEmitter:
         assert EventEmitter.dropped_db_writes == before + 1
 
     @pytest.mark.asyncio
+    async def test_write_db_increments_dropped_metric_once_per_failed_flush(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ) -> None:
+        mock_conn = _add_transaction_cm(AsyncMock())
+        mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
+
+        @asynccontextmanager
+        async def fake_connection():
+            yield mock_conn
+
+        mock_pool = AsyncMock()
+        mock_pool.connection = fake_connection
+        emitter = EventEmitter(db_pool=mock_pool, stdout_enabled=False)
+
+        await emitter._write_db("tx-123", "test.event", {"body": "secret"}, datetime.now(UTC))
+
+        point = _metric_point(metric_reader, "luthien.db.event_write.dropped")
+        assert point.value == 1
+
+    @pytest.mark.asyncio
     async def test_write_db_increments_dropped_counter_on_os_error(self) -> None:
         """_write_db() increments dropped_db_writes on OSError."""
         mock_conn = _add_transaction_cm(AsyncMock())
@@ -292,6 +373,72 @@ class TestEventEmitter:
         before = EventEmitter.dropped_db_writes
         await emitter.emit("tx-123", "test.event", {"key": "value"})
         assert EventEmitter.dropped_db_writes == before + 1
+
+    @pytest.mark.asyncio
+    async def test_write_db_emits_span_with_duration(
+        self,
+        span_exporter: InMemorySpanExporter,
+    ) -> None:
+        mock_conn = _add_transaction_cm(AsyncMock())
+
+        @asynccontextmanager
+        async def fake_connection():
+            yield mock_conn
+
+        mock_pool = AsyncMock()
+        mock_pool.connection = fake_connection
+        emitter = EventEmitter(db_pool=mock_pool, stdout_enabled=False)
+
+        await emitter._write_db("tx-123", "test.event", {"body": "secret"}, datetime.now(UTC))
+
+        spans = {span.name: span for span in span_exporter.get_finished_spans()}
+        attrs = spans["emitter.write_db"].attributes
+        assert attrs is not None
+        assert isinstance(attrs["db.write.duration_ms"], int)
+        assert attrs["db.write.duration_ms"] >= 0
+        assert "body" not in attrs
+
+    @pytest.mark.asyncio
+    async def test_write_db_records_duration_metric(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ) -> None:
+        mock_conn = _add_transaction_cm(AsyncMock())
+
+        @asynccontextmanager
+        async def fake_connection():
+            yield mock_conn
+
+        mock_pool = AsyncMock()
+        mock_pool.connection = fake_connection
+        emitter = EventEmitter(db_pool=mock_pool, stdout_enabled=False)
+
+        await emitter._write_db("tx-123", "test.event", {"body": "secret"}, datetime.now(UTC))
+
+        point = _metric_point(metric_reader, "luthien.db.write.duration_ms")
+        assert point.count == 1
+        assert point.sum >= 0
+
+    @pytest.mark.asyncio
+    async def test_write_db_marks_span_error_on_db_failure(
+        self,
+        span_exporter: InMemorySpanExporter,
+    ) -> None:
+        mock_conn = _add_transaction_cm(AsyncMock())
+        mock_conn.execute = AsyncMock(side_effect=asyncpg.PostgresError("connection lost"))
+
+        @asynccontextmanager
+        async def fake_connection():
+            yield mock_conn
+
+        mock_pool = AsyncMock()
+        mock_pool.connection = fake_connection
+        emitter = EventEmitter(db_pool=mock_pool, stdout_enabled=False)
+
+        await emitter._write_db("tx-123", "test.event", {"body": "secret"}, datetime.now(UTC))
+
+        spans = {span.name: span for span in span_exporter.get_finished_spans()}
+        assert spans["emitter.write_db"].status.status_code == StatusCode.ERROR
 
     @pytest.mark.asyncio
     async def test_write_db_does_not_catch_unrelated_exceptions(self) -> None:
@@ -400,3 +547,70 @@ class TestWriteDbAtomicity:
         async with pool.connection() as conn:
             events = await conn.fetch("SELECT * FROM conversation_events WHERE call_id = $1", "tx-3")
         assert events == []
+
+
+class TestSpanEventAttributes:
+    """The span event carries only what OTel attributes can hold (the sinks get everything).
+
+    Spreading the whole JSON payload into ``add_event`` made the SDK log
+    ``Invalid type dict|NoneType for attribute ...`` for every nested or None field of every
+    event (~16.5k lines/day in production) and drop the field from the event anyway.
+    Exercised through ``emit`` on a real SDK span, per this suite's convention.
+    """
+
+    @staticmethod
+    async def _event_attributes_for(payload: dict[str, Any]) -> tuple[Any, list[str]]:
+        """Emit ``payload`` inside a real SDK span; return (the span's one event, warnings)."""
+        from opentelemetry.sdk.trace import TracerProvider
+
+        tracer = TracerProvider().get_tracer(__name__)
+        emitter = EventEmitter(stdout_enabled=False)
+        attribute_logger = logging.getLogger("opentelemetry.attributes")
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Capture()
+        attribute_logger.addHandler(handler)
+        try:
+            with tracer.start_as_current_span("test") as span:
+                await emitter.emit("tx-123", "policy.request", payload)
+        finally:
+            attribute_logger.removeHandler(handler)
+        events = list(getattr(span, "events", []))
+        assert len(events) == 1
+        return events[0], [r.getMessage() for r in records if "Invalid type" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_emit_adds_a_clean_span_event(self) -> None:
+        """No attribute warning, and the event holds exactly the scalar subset."""
+        event, warnings = await self._event_attributes_for(
+            {
+                "user_id": None,
+                "session_id": "sess-9",
+                "original_request": {"model": "x", "messages": []},
+                "chunks": 17,
+                "flagged": True,
+                "tags": ["a", "b"],
+                "empty": [],
+            }
+        )
+        assert warnings == []
+        assert event.name == "policy.request"
+        assert dict(event.attributes or {}) == {
+            "transaction_id": "tx-123",
+            "session_id": "sess-9",
+            "chunks": 17,
+            "flagged": True,
+            "tags": ("a", "b"),
+            "empty": (),
+        }
+
+    @pytest.mark.asyncio
+    async def test_mixed_type_lists_are_left_to_the_sinks(self) -> None:
+        """A bool/int mix is not a homogeneous OTel sequence; it is omitted, not warned about."""
+        event, warnings = await self._event_attributes_for({"mixed": [True, 1], "rev": [1, True]})
+        assert warnings == []
+        assert dict(event.attributes or {}) == {"transaction_id": "tx-123"}

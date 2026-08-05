@@ -373,6 +373,65 @@ class TestBeforeSend:
         event = self._make_event()
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
 
+    def test_drops_client_disconnect(self):
+        """Client walked away mid-body-read — starlette.requests.ClientDisconnect,
+        always unhandled, never a proxy defect (LUTHIEN-3/4/E)."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {"values": [{"type": "ClientDisconnect", "module": "starlette.requests", "value": None}]}
+        assert _sentry_before_send(event, {}) is None
+
+    def test_drops_client_disconnect_flattened_from_exception_group(self):
+        """anyio's TaskGroup wraps a mid-body ClientDisconnect in an ExceptionGroup;
+        the SDK flattens both into event["exception"]["values"] before before_send
+        runs, so the group wrapper must not hide the member we want dropped."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {
+            "values": [
+                {"type": "ExceptionGroup", "module": None, "value": "unhandled errors in a TaskGroup"},
+                {"type": "ClientDisconnect", "module": "starlette.requests", "value": None},
+            ]
+        }
+        assert _sentry_before_send(event, {}) is None
+
+    def test_keeps_mixed_exception_group_with_non_client_disconnect_member(self):
+        """ExceptionGroup(ClientDisconnect, RuntimeError) must still report: the
+        RuntimeError is a genuine proxy-side failure riding alongside the
+        disconnect, and the old any()-based check would have swallowed the
+        whole event just because one member matched (thermonuclear-deep-review
+        finding on PR #814)."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {
+            "values": [
+                {"type": "ExceptionGroup", "module": None, "value": "unhandled errors in a TaskGroup"},
+                {"type": "ClientDisconnect", "module": "starlette.requests", "value": None},
+                {"type": "RuntimeError", "module": "builtins", "value": "boom"},
+            ]
+        }
+        assert _sentry_before_send(event, {}) is not None
+
+    def test_keeps_exception_group_of_only_non_dropped_members(self):
+        """A group wrapper with no ClientDisconnect member at all must report,
+        exercising the case where the wrapper entry alone would otherwise be
+        mistaken for a leaf."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {
+            "values": [
+                {"type": "ExceptionGroup", "module": None, "value": "unhandled errors in a TaskGroup"},
+                {"type": "RuntimeError", "module": "builtins", "value": "boom"},
+                {"type": "ValueError", "module": "builtins", "value": "bad value"},
+            ]
+        }
+        assert _sentry_before_send(event, {}) is not None
+
+    def test_keeps_same_named_exception_from_different_module(self):
+        """Matching is (module, type), not type alone, so an unrelated class that
+        happens to share the name ClientDisconnect is not silently swallowed."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {
+            "values": [{"type": "ClientDisconnect", "module": "some_other_package.errors", "value": None}]
+        }
+        assert _sentry_before_send(event, {}) is not None
+
     def test_strips_server_name(self):
         event = self._make_event()
         hint = {}
@@ -524,7 +583,48 @@ class TestBeforeSend:
         ):
             init_sentry(settings)
 
-        mock_ignore.assert_called_once_with("opentelemetry.sdk.trace.export")
+        ignored = {call.args[0] for call in mock_ignore.call_args_list}
+        assert ignored == {"opentelemetry.*"}
+
+    def test_opentelemetry_wildcard_ignores_every_sub_logger(self, monkeypatch):
+        """Pins the fnmatch semantics `ignore_logger("opentelemetry.*")` depends on.
+
+        Covers loggers observed in production noise (LUTHIEN-C/F export 403s,
+        the context-detach ValueError) plus a hypothetical future one, so a
+        new OTel exporter/instrumentation logger is suppressed without a code
+        change here.
+        """
+        monkeypatch.setenv("SENTRY_ENABLED", "true")
+        monkeypatch.setenv("SENTRY_DSN", "https://fake@sentry.io/0")
+
+        from unittest.mock import patch
+
+        from sentry_sdk.integrations.logging import _IGNORED_LOGGERS as ignored_loggers
+        from sentry_sdk.integrations.logging import EventHandler
+
+        from luthien_proxy.observability.sentry import init_sentry
+        from luthien_proxy.settings import Settings, clear_settings_cache
+
+        clear_settings_cache()
+        settings = Settings(_env_file=None)
+
+        ignored_loggers.clear()
+        with patch("luthien_proxy.observability.sentry.sentry_sdk.init"):
+            init_sentry(settings)
+
+        handler = EventHandler()
+        for name in (
+            "opentelemetry.context",
+            "opentelemetry.sdk.trace.export",
+            "opentelemetry.exporter.otlp.proto.http.trace_exporter",
+            "opentelemetry.exporter.otlp.proto.http.metric_exporter",
+            "opentelemetry.instrumentation.some_future_thing",
+        ):
+            record = logging.LogRecord(name, logging.ERROR, __file__, 1, "boom", (), None)
+            assert not handler._can_record(record), f"expected {name} to be ignored"
+
+        record = logging.LogRecord("luthien_proxy.pipeline", logging.ERROR, __file__, 1, "boom", (), None)
+        assert handler._can_record(record)
 
 
 class TestSentryDisabledInTests:

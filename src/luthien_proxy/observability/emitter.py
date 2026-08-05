@@ -15,11 +15,13 @@ import json
 import logging
 import sqlite3
 import sys
+import time
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
 import asyncpg
-from opentelemetry import trace
+from opentelemetry import metrics, trace
+from opentelemetry.trace import Status, StatusCode
 
 from luthien_proxy.observability.event_publisher import EventPublisherProtocol
 from luthien_proxy.observability.session_summary import update_session_summary
@@ -68,7 +70,53 @@ def _safe_serialize(obj: Any) -> Any:
     return str(obj)
 
 
+# What an OpenTelemetry attribute value may be: one of these scalars, or a sequence of one of
+# them. Anything else is refused by the SDK at `add_event` time with a WARNING per key and
+# silently dropped from the event.
+_SPAN_ATTRIBUTE_SCALARS = (bool, str, bytes, int, float)
+
+
+def _span_event_attributes(transaction_id: str, safe_data: dict[str, Any]) -> dict[str, Any]:
+    """The subset of an event's payload a span event can carry.
+
+    Event payloads are JSON documents: `original_request`/`final_request`/`payload` are nested
+    dicts, and `user_id`/`session_id` are None when unknown. Spreading them into `add_event`
+    made the SDK log ``Invalid type dict|NoneType for attribute ...`` for every such key on
+    every event and drop the key -- the span event ended up with neither the field nor a
+    record that it was omitted. The full payload still reaches the stdout, database and
+    publisher sinks, so the span event keeps the scalar fields that make it searchable and
+    leaves request bodies to the sinks built to hold them: None is skipped, scalars and
+    homogeneous scalar lists (empty included -- the SDK records those) pass through,
+    everything else is left out.
+    """
+    attributes: dict[str, Any] = {"transaction_id": transaction_id}
+    for key, value in safe_data.items():
+        if value is None:
+            continue
+        if isinstance(value, _SPAN_ATTRIBUTE_SCALARS):
+            attributes[key] = value
+            continue
+        if isinstance(value, list) and (
+            not value
+            or (isinstance(value[0], _SPAN_ATTRIBUTE_SCALARS) and all(type(item) is type(value[0]) for item in value))
+        ):
+            attributes[key] = value
+    return attributes
+
+
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
+meter = metrics.get_meter(__name__)
+db_event_write_dropped_counter = meter.create_counter(
+    "luthien.db.event_write.dropped",
+    unit="1",
+    description="Count of dropped DB event writes",
+)
+db_write_duration_histogram = meter.create_histogram(
+    "luthien.db.write.duration_ms",
+    unit="ms",
+    description="Duration of DB event writes",
+)
 
 
 def _log_task_exception(task: asyncio.Task[None]) -> None:
@@ -154,10 +202,11 @@ class EventEmitter:
         # Ensure data is JSON-serializable before passing to sinks
         safe_data = _safe_serialize(data)
 
-        # Add to current OTel span as a span event
+        # Add to the current OTel span as a span event. Only the scalar subset of the payload
+        # goes on the event (see _span_event_attributes); the sinks below get all of it.
         span = trace.get_current_span()
         if span.is_recording():
-            span.add_event(event_type, {"transaction_id": transaction_id, **safe_data})
+            span.add_event(event_type, _span_event_attributes(transaction_id, safe_data))
 
         # Emit to all sinks concurrently
         tasks = []
@@ -242,74 +291,82 @@ class EventEmitter:
         session_id = data.get("session_id") if isinstance(data, dict) else None
         user_id = data.get("user_id") if isinstance(data, dict) else None
 
-        try:
-            async with db_pool.connection() as conn:
-                # All three writes must commit together. Without an explicit
-                # transaction each statement auto-commits, so a failure in the
-                # session_summaries update would leave the event row already
-                # committed and the materialized summary permanently out of sync
-                # (the 021 backfill's ON CONFLICT DO NOTHING can't repair drift).
-                # Wrapping them keeps conversation_events and session_summaries
-                # consistent and makes dropped_db_writes honest (all-or-nothing).
-                async with conn.transaction():
-                    # Ensure call row exists with session_id and user_id
-                    await conn.execute(
-                        """
-                        INSERT INTO conversation_calls (call_id, created_at, session_id, user_id)
-                        VALUES ($1, $2, $3, $4)
-                        ON CONFLICT (call_id) DO UPDATE SET
-                            session_id = COALESCE(conversation_calls.session_id, EXCLUDED.session_id),
-                            user_id = COALESCE(conversation_calls.user_id, EXCLUDED.user_id)
-                        """,
-                        transaction_id,
-                        timestamp,
-                        session_id,
-                        user_id,
-                    )
-
-                    # Insert event row. user_id is intentionally NOT stored on
-                    # conversation_events — it lives on conversation_calls (which
-                    # query paths join through). Denormalizing onto every event
-                    # row paid a write cost for zero readers.
-                    await conn.execute(
-                        """
-                        INSERT INTO conversation_events (call_id, event_type, payload, created_at, session_id)
-                        VALUES ($1, $2, $3, $4, $5)
-                        """,
-                        transaction_id,
-                        event_type,
-                        json.dumps(data),
-                        timestamp,
-                        session_id,
-                    )
-
-                    # Incrementally maintain the materialized session_summaries row.
-                    # Only sessions with a session_id are listed by the history page,
-                    # so events without one contribute nothing here.
-                    if isinstance(session_id, str) and session_id:
-                        await update_session_summary(
-                            conn,
-                            session_id=session_id,
-                            event_type=event_type,
-                            data=data,
-                            user_id=user_id if isinstance(user_id, str) else None,
-                            timestamp=timestamp,
+        write_started_at = time.monotonic()
+        with tracer.start_as_current_span("emitter.write_db") as span:
+            try:
+                async with db_pool.connection() as conn:
+                    # All three writes must commit together. Without an explicit
+                    # transaction each statement auto-commits, so a failure in the
+                    # session_summaries update would leave the event row already
+                    # committed and the materialized summary permanently out of sync
+                    # (the 021 backfill's ON CONFLICT DO NOTHING can't repair drift).
+                    # Wrapping them keeps conversation_events and session_summaries
+                    # consistent and makes dropped_db_writes honest (all-or-nothing).
+                    async with conn.transaction():
+                        # Ensure call row exists with session_id and user_id
+                        await conn.execute(
+                            """
+                            INSERT INTO conversation_calls (call_id, created_at, session_id, user_id)
+                            VALUES ($1, $2, $3, $4)
+                            ON CONFLICT (call_id) DO UPDATE SET
+                                session_id = COALESCE(conversation_calls.session_id, EXCLUDED.session_id),
+                                user_id = COALESCE(conversation_calls.user_id, EXCLUDED.user_id)
+                            """,
+                            transaction_id,
+                            timestamp,
+                            session_id,
+                            user_id,
                         )
 
-            logger.debug(f"Wrote event to db: {event_type} (transaction_id={transaction_id})")
-        # Driver-agnostic DB failure handling: Postgres raises asyncpg errors,
-        # SQLite (aiosqlite) raises sqlite3.Error subclasses. Both must tick the
-        # dropped counter — without sqlite3.Error, a failed SQLite write (e.g. in
-        # the session_summaries update, the widest SQL surface here) would escape
-        # _write_db and be silently absorbed by emit()'s gather(return_exceptions=
-        # True), leaving dropped_db_writes misleadingly flat. Genuine logic bugs
-        # (TypeError/ValueError/etc.) intentionally still propagate.
-        except (OSError, asyncpg.PostgresError, asyncpg.InternalClientError, sqlite3.Error) as e:
-            EventEmitter.dropped_db_writes += 1
-            logger.warning(
-                f"Failed to write event to database ({EventEmitter.dropped_db_writes} total dropped): {repr(e)}",
-                exc_info=True,
-            )
+                        # Insert event row. user_id is intentionally NOT stored on
+                        # conversation_events — it lives on conversation_calls (which
+                        # query paths join through). Denormalizing onto every event
+                        # row paid a write cost for zero readers.
+                        await conn.execute(
+                            """
+                            INSERT INTO conversation_events (call_id, event_type, payload, created_at, session_id)
+                            VALUES ($1, $2, $3, $4, $5)
+                            """,
+                            transaction_id,
+                            event_type,
+                            json.dumps(data),
+                            timestamp,
+                            session_id,
+                        )
+
+                        # Incrementally maintain the materialized session_summaries row.
+                        # Only sessions with a session_id are listed by the history page,
+                        # so events without one contribute nothing here.
+                        if isinstance(session_id, str) and session_id:
+                            await update_session_summary(
+                                conn,
+                                session_id=session_id,
+                                event_type=event_type,
+                                data=data,
+                                user_id=user_id if isinstance(user_id, str) else None,
+                                timestamp=timestamp,
+                            )
+
+                logger.debug(f"Wrote event to db: {event_type} (transaction_id={transaction_id})")
+            # Driver-agnostic DB failure handling: Postgres raises asyncpg errors,
+            # SQLite (aiosqlite) raises sqlite3.Error subclasses. Both must tick the
+            # dropped counter — without sqlite3.Error, a failed SQLite write (e.g. in
+            # the session_summaries update, the widest SQL surface here) would escape
+            # _write_db and be silently absorbed by emit()'s gather(return_exceptions=
+            # True), leaving dropped_db_writes misleadingly flat. Genuine logic bugs
+            # (TypeError/ValueError/etc.) intentionally still propagate.
+            except (OSError, asyncpg.PostgresError, asyncpg.InternalClientError, sqlite3.Error) as e:
+                span.set_status(Status(StatusCode.ERROR, "db write failed"))
+                EventEmitter.dropped_db_writes += 1
+                db_event_write_dropped_counter.add(1)
+                logger.warning(
+                    f"Failed to write event to database ({EventEmitter.dropped_db_writes} total dropped): {repr(e)}",
+                    exc_info=True,
+                )
+            finally:
+                duration_ms = int((time.monotonic() - write_started_at) * 1000)
+                span.set_attribute("db.write.duration_ms", duration_ms)
+                db_write_duration_histogram.record(duration_ms)
 
     async def _write_events(
         self,

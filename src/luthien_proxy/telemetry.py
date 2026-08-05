@@ -20,16 +20,21 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Final
 
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.context import Context, attach, detach
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
     OTLPSpanExporter as GrpcSpanExporter,
 )
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as HttpSpanExporter,
 )
+from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
@@ -75,16 +80,17 @@ def restore_context(ctx: Context) -> Generator[object, None, None]:
         detach(token)
 
 
-def _get_otel_config() -> tuple[bool, str, str, str, str, str]:
+def _get_otel_config() -> tuple[bool, str, str, str, str, str, str]:
     """Get OpenTelemetry configuration from settings.
 
     Returns:
-        Tuple of (enabled, endpoint, service_name, service_version, environment, protocol)
+        Tuple of (enabled, traces_endpoint, metrics_endpoint, service_name, service_version, environment, protocol)
     """
     settings = get_settings()
     return (
         settings.otel_enabled,
         settings.otel_exporter_otlp_endpoint,
+        settings.otel_exporter_otlp_metrics_endpoint,
         settings.service_name,
         settings.service_version,
         settings.environment,
@@ -127,6 +133,16 @@ def _build_otlp_exporter(protocol: str, endpoint: str) -> SpanExporter:
     raise ValueError(f"Unsupported OTEL_EXPORTER_OTLP_PROTOCOL={protocol!r}; expected one of: {supported}")
 
 
+def _build_resource(service_name: str, service_version: str, environment: str) -> Resource:
+    return Resource.create(
+        {
+            "service.name": service_name,
+            "service.version": service_version,
+            "deployment.environment": environment,
+        }
+    )
+
+
 def configure_tracing() -> trace.Tracer:
     """Configure OpenTelemetry tracing.
 
@@ -138,21 +154,16 @@ def configure_tracing() -> trace.Tracer:
     Returns:
         Configured tracer for manual instrumentation
     """
-    otel_enabled, otel_endpoint, service_name, service_version, environment, protocol = _get_otel_config()
+    otel_enabled, otel_endpoint, _metrics_endpoint, service_name, service_version, environment, protocol = (
+        _get_otel_config()
+    )
 
     if not otel_enabled:
         logger.debug("OpenTelemetry disabled (OTEL_ENABLED=false)")
         _silence_otel_loggers()
         return trace.get_tracer(__name__)
 
-    # Define resource attributes
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.version": service_version,
-            "deployment.environment": environment,
-        }
-    )
+    resource = _build_resource(service_name, service_version, environment)
 
     # Create tracer provider
     provider = TracerProvider(resource=resource)
@@ -171,6 +182,29 @@ def configure_tracing() -> trace.Tracer:
     logger.info(f"OpenTelemetry configured: {service_name} → {otel_endpoint} ({protocol})")
 
     return trace.get_tracer(__name__)
+
+
+def configure_metrics() -> None:
+    """Configure OTLP metrics export via a periodic-exporting meter provider."""
+    otel_enabled, _otel_endpoint, metrics_endpoint, service_name, service_version, environment, _protocol = (
+        _get_otel_config()
+    )
+
+    if not otel_enabled or not metrics_endpoint:
+        logger.debug("OpenTelemetry metrics disabled")
+        _silence_otel_loggers()
+        return
+
+    reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=metrics_endpoint),
+        export_interval_millis=15000,
+    )
+    provider = MeterProvider(
+        resource=_build_resource(service_name, service_version, environment),
+        metric_readers=[reader],
+    )
+    metrics.set_meter_provider(provider)
+    logger.info(f"OpenTelemetry metrics configured: {service_name} → {metrics_endpoint}")
 
 
 def instrument_app(app) -> None:
@@ -202,6 +236,20 @@ def instrument_redis() -> None:
 
     RedisInstrumentor().instrument()
     logger.info("Redis instrumented with OpenTelemetry")
+
+
+def instrument_db() -> None:
+    """Instrument the Postgres drivers with OpenTelemetry.
+
+    Creates a span per database query for asyncpg (the primary connection-pool
+    driver) and psycopg, so slow queries surface in traces.
+    """
+    if not get_settings().otel_enabled:
+        return
+
+    AsyncPGInstrumentor().instrument()
+    PsycopgInstrumentor().instrument()
+    logger.info("Postgres (asyncpg + psycopg) instrumented with OpenTelemetry")
 
 
 def configure_logging() -> None:
@@ -263,8 +311,10 @@ def setup_telemetry(app=None) -> trace.Tracer:
         Configured tracer for manual instrumentation
     """
     tracer = configure_tracing()
+    configure_metrics()
     configure_logging()
     instrument_redis()
+    instrument_db()
 
     if app:
         instrument_app(app)
@@ -281,7 +331,9 @@ __all__ = [
     "setup_telemetry",
     "tracer",
     "configure_tracing",
+    "configure_metrics",
     "configure_logging",
     "instrument_app",
     "instrument_redis",
+    "instrument_db",
 ]

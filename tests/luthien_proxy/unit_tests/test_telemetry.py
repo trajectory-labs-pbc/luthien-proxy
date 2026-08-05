@@ -4,10 +4,12 @@
 """Tests for telemetry module."""
 
 import logging
+from collections.abc import Iterator
 from unittest.mock import Mock, patch
 
+import opentelemetry.metrics._internal as metrics_internal
 import pytest
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
     OTLPSpanExporter as GrpcSpanExporter,
@@ -15,6 +17,8 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as HttpSpanExporter,
 )
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from luthien_proxy import telemetry
 from luthien_proxy.settings import Settings
@@ -27,9 +31,28 @@ def _config(
     *,
     enabled: bool = True,
     endpoint: str = "http://tempo:4318/v1/traces",
+    metrics_endpoint: str = "http://tempo:4318/v1/metrics",
     protocol: str = "http/protobuf",
-) -> tuple[bool, str, str, str, str, str]:
-    return (enabled, endpoint, "svc", "1.0", "dev", protocol)
+) -> tuple[bool, str, str, str, str, str, str]:
+    return (enabled, endpoint, metrics_endpoint, "svc", "1.0", "dev", protocol)
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class TestSilenceOtelLoggers:
@@ -84,6 +107,34 @@ class TestConfigureTracing:
             mock_info.assert_not_called()
 
 
+class TestConfigureMetrics:
+    """Test metrics configuration."""
+
+    @patch("luthien_proxy.telemetry._get_otel_config")
+    @patch("luthien_proxy.telemetry._silence_otel_loggers")
+    def test_disabled_noops_and_silences_loggers(self, mock_silence, mock_config):
+        """When OTel is disabled, configure_metrics returns None and silences noisy loggers."""
+        mock_config.return_value = _config(enabled=False, metrics_endpoint="")
+
+        result = telemetry.configure_metrics()
+
+        assert result is None
+        mock_silence.assert_called_once()
+
+    @patch("luthien_proxy.telemetry.OTLPMetricExporter")
+    @patch("luthien_proxy.telemetry._get_otel_config")
+    def test_uses_separate_metrics_endpoint_verbatim(self, mock_config, mock_exporter, metric_reader):
+        """Metrics exporter uses OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, not traces + /v1/metrics."""
+        mock_config.return_value = _config(
+            endpoint="http://collector:4318/v1/traces",
+            metrics_endpoint="http://collector:4318/v1/metrics",
+        )
+
+        telemetry.configure_metrics()
+
+        mock_exporter.assert_called_once_with(endpoint="http://collector:4318/v1/metrics")
+
+
 class TestBuildOtlpExporter:
     """Test exporter dispatch on the protocol setting."""
 
@@ -136,6 +187,17 @@ class TestProtocolEnvVarBinding:
         settings = Settings(_env_file=None)
         assert settings.otel_exporter_otlp_endpoint == "http://tempo:4318/v1/traces"
 
+    def test_default_metrics_endpoint_targets_http_port_with_v1_metrics_path(self, monkeypatch):
+        """Metrics endpoint is configured separately from the traces endpoint."""
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", raising=False)
+        settings = Settings(_env_file=None)
+        assert settings.otel_exporter_otlp_metrics_endpoint == "http://tempo:4318/v1/metrics"
+
+    def test_metrics_endpoint_env_var_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://custom:4318/v1/metrics")
+        settings = Settings(_env_file=None)
+        assert settings.otel_exporter_otlp_metrics_endpoint == "http://custom:4318/v1/metrics"
+
 
 class TestInstrumentApp:
     """Test FastAPI instrumentation."""
@@ -153,6 +215,15 @@ class TestInstrumentRedis:
     def test_does_not_raise_exception(self):
         """Test that instrument_redis doesn't raise exceptions."""
         telemetry.instrument_redis()
+        # No exception should be raised
+
+
+class TestInstrumentDb:
+    """Test Postgres (asyncpg + psycopg) instrumentation."""
+
+    def test_does_not_raise_exception(self):
+        """instrument_db must not raise (no-op when OTEL is disabled)."""
+        telemetry.instrument_db()
         # No exception should be raised
 
 
@@ -195,11 +266,17 @@ class TestSetupTelemetry:
     """Test setup_telemetry orchestration."""
 
     @patch("luthien_proxy.telemetry.configure_tracing")
+    @patch("luthien_proxy.telemetry.configure_metrics")
     @patch("luthien_proxy.telemetry.configure_logging")
     @patch("luthien_proxy.telemetry.instrument_redis")
     @patch("luthien_proxy.telemetry.instrument_app")
     def test_without_app(
-        self, mock_instrument_app, mock_instrument_redis, mock_configure_logging, mock_configure_tracing
+        self,
+        mock_instrument_app,
+        mock_instrument_redis,
+        mock_configure_logging,
+        mock_configure_metrics,
+        mock_configure_tracing,
     ):
         """Test setup without app calls all setup functions except instrument_app."""
         mock_tracer = Mock()
@@ -208,16 +285,25 @@ class TestSetupTelemetry:
         result = telemetry.setup_telemetry()
 
         mock_configure_tracing.assert_called_once()
+        mock_configure_metrics.assert_called_once()
         mock_configure_logging.assert_called_once()
         mock_instrument_redis.assert_called_once()
         mock_instrument_app.assert_not_called()
         assert result == mock_tracer
 
     @patch("luthien_proxy.telemetry.configure_tracing")
+    @patch("luthien_proxy.telemetry.configure_metrics")
     @patch("luthien_proxy.telemetry.configure_logging")
     @patch("luthien_proxy.telemetry.instrument_redis")
     @patch("luthien_proxy.telemetry.instrument_app")
-    def test_with_app(self, mock_instrument_app, mock_instrument_redis, mock_configure_logging, mock_configure_tracing):
+    def test_with_app(
+        self,
+        mock_instrument_app,
+        mock_instrument_redis,
+        mock_configure_logging,
+        mock_configure_metrics,
+        mock_configure_tracing,
+    ):
         """Test setup with app calls all setup functions including instrument_app."""
         mock_tracer = Mock()
         mock_configure_tracing.return_value = mock_tracer
@@ -226,10 +312,25 @@ class TestSetupTelemetry:
         result = telemetry.setup_telemetry(mock_app)
 
         mock_configure_tracing.assert_called_once()
+        mock_configure_metrics.assert_called_once()
         mock_configure_logging.assert_called_once()
         mock_instrument_redis.assert_called_once()
         mock_instrument_app.assert_called_once_with(mock_app)
         assert result == mock_tracer
+
+    @patch("luthien_proxy.telemetry.instrument_db")
+    @patch("luthien_proxy.telemetry.instrument_redis")
+    @patch("luthien_proxy.telemetry.configure_logging")
+    @patch("luthien_proxy.telemetry.configure_tracing")
+    def test_instruments_db(
+        self, mock_configure_tracing, mock_configure_logging, mock_instrument_redis, mock_instrument_db
+    ):
+        """setup_telemetry wires Postgres DB instrumentation."""
+        mock_configure_tracing.return_value = Mock()
+
+        telemetry.setup_telemetry()
+
+        mock_instrument_db.assert_called_once()
 
 
 class TestRestoreContext:

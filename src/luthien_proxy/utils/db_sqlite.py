@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Mapping, Sequence
 
@@ -112,6 +113,12 @@ def _convert_arg(value: object) -> object:
         return int(value)
     if isinstance(value, dict | list):
         return json.dumps(value)
+    if isinstance(value, datetime):
+        # stdlib sqlite3's legacy datetime adapter uses isoformat(" ") (space
+        # separator); the app stores/compares timestamps as ISO-8601 with a "T"
+        # (see parse_db_ts and created_at range filters). Normalize here so a
+        # datetime bind sorts/compares identically to stored ISO-8601 strings.
+        return value.isoformat()
     return value
 
 

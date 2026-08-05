@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from luthien_proxy.utils.db_sqlite import (
@@ -181,6 +183,18 @@ class TestConvertArg:
         assert _convert_arg("hello") == "hello"
         assert _convert_arg(None) is None
 
+    def test_datetime_serialized_as_isoformat_t_separator(self):
+        # Root-cause guard: stdlib sqlite3's legacy datetime adapter serializes
+        # with isoformat(" ") (space separator). The app stores/compares
+        # created_at as ISO-8601 with a "T" (parse_db_ts + `created_at < $ts`
+        # range filters). A space-separated value sorts BEFORE the "T" form
+        # (0x20 < 0x54), so a turn's own event satisfied
+        # `created_at < own_ts.isoformat()` and zeroed the history request-message
+        # delta on SQLite. Binding datetimes as isoformat() keeps them comparable.
+        value = datetime(2026, 7, 11, 10, 0, 0, tzinfo=timezone.utc)
+        assert _convert_arg(value) == "2026-07-11T10:00:00+00:00"
+        assert "T" in str(_convert_arg(value))
+
 
 class TestParseSqliteUrl:
     def test_absolute_path(self):
@@ -318,5 +332,30 @@ class TestSqlitePool:
 
                 val_none = await conn.fetchval("SELECT name FROM t WHERE id = $1", 999)
                 assert val_none is None
+        finally:
+            await pool.close()
+
+    @pytest.mark.asyncio
+    async def test_datetime_bind_comparable_with_isoformat_string(self):
+        # Regression: a datetime bind must round-trip as ISO-8601 with a "T"
+        # separator so SQL range filters comparing `created_at < $ts` (where
+        # $ts is a Python .isoformat() string) behave correctly. stdlib sqlite3's
+        # legacy adapter stored a space separator, which sorts before the "T"
+        # form (0x20 < 0x54); a row's own timestamp then satisfied
+        # `created_at < own_ts.isoformat()`, silently corrupting history
+        # pagination, session-search time ranges, and retention cutoffs.
+        pool = await create_sqlite_pool("sqlite://:memory:")
+        try:
+            await pool.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TEXT)")
+            ts = datetime(2026, 7, 11, 10, 0, 0, tzinfo=timezone.utc)
+            await pool.execute("INSERT INTO t (id, created_at) VALUES ($1, $2)", 1, ts)
+
+            stored = await pool.fetchrow("SELECT created_at FROM t WHERE id = $1", 1)
+            assert stored is not None
+            assert stored["created_at"] == "2026-07-11T10:00:00+00:00"
+
+            # A strict `< own timestamp` filter must exclude the row itself.
+            rows = await pool.fetch("SELECT id FROM t WHERE created_at < $1", ts.isoformat())
+            assert [row["id"] for row in rows] == []
         finally:
             await pool.close()
