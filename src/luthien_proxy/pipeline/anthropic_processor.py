@@ -34,7 +34,7 @@ from anthropic.lib.streaming import MessageStreamEvent
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.context import get_current
 from opentelemetry.trace import Span
 
@@ -42,7 +42,7 @@ from luthien_proxy.credential_manager import CredentialManager
 from luthien_proxy.credentials import Credential, CredentialError
 from luthien_proxy.exceptions import BackendAPIError
 from luthien_proxy.inference.registry import InferenceProviderRegistry
-from luthien_proxy.llm.anthropic_client import AnthropicClient
+from luthien_proxy.llm.anthropic_client import AnthropicClient, AnthropicUpstreamTransportError
 from luthien_proxy.llm.types.anthropic import (
     AnthropicContentBlock,
     AnthropicRequest,
@@ -50,6 +50,7 @@ from luthien_proxy.llm.types.anthropic import (
     build_usage,
 )
 from luthien_proxy.observability.emitter import EventEmitterProtocol
+from luthien_proxy.observability.sentry import tag_credential_provenance, tag_request_provenance
 from luthien_proxy.pipeline.client_format import ClientFormat
 from luthien_proxy.pipeline.policy_context_injection import inject_policy_awareness_anthropic
 from luthien_proxy.pipeline.session import (
@@ -94,6 +95,128 @@ class _StreamErrorEvent(TypedDict):
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+meter = metrics.get_meter(__name__)
+stream_first_event_histogram = meter.create_histogram(
+    "luthien.stream.first_event_ms",
+    unit="ms",
+    description="Time to first streamed event",
+)
+
+
+# --- Streaming keepalive ------------------------------------------------------
+# Anthropic's wire stream emits `ping` events during long generations to keep the
+# connection alive, but the Anthropic SDK's typed stream (messages.create(
+# stream=True)) drops them. Without re-injecting keepalives, a model that stays
+# silent for a long pre-content phase makes the proxy->client connection idle, and
+# an intermediary (e.g. the ALB idle timeout) cuts the stream mid-flight even
+# though the request is healthy. We emit an Anthropic-style `ping` whenever the
+# upstream produces no event within STREAM_KEEPALIVE_SECONDS.
+STREAM_KEEPALIVE_SECONDS = 15.0
+_KEEPALIVE_SSE = 'event: ping\ndata: {"type": "ping"}\n\n'
+_STREAM_DONE = object()
+
+
+class _Keepalive:
+    """Sentinel yielded by `_stream_with_keepalive` during an upstream gap."""
+
+
+_KEEPALIVE = _Keepalive()
+
+
+class _StreamError:
+    """Sentinel carrying an exception raised while pumping `source` to completion.
+
+    Queued instead of raised directly so the pump task (see `_pump_to_queue`) can
+    report a failure to the consumer without itself needing to be re-awaited from
+    a context that still holds the failing span open.
+    """
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+async def _pump_to_queue(
+    source: AsyncIterator[AnthropicPolicyEmission],
+    queue: "asyncio.Queue[object]",
+) -> None:
+    """Drive `source` to completion from a single persistent task, queuing each item.
+
+    `AnthropicClient.stream()` and `_AnthropicPolicyIO._stream()` each hold an
+    OpenTelemetry span open across every chunk of the upstream response: the
+    span's `with` block attaches its context once, on the first chunk, and
+    detaches it once, when the stream is exhausted. `contextvars.Context` is
+    copied per `asyncio.Task` (see CPython's `asyncio.Task.__init__`), so a
+    context token attached while running in one Task cannot be detached while
+    running in another — `contextvars.Context.reset()` raises `ValueError`, which
+    `opentelemetry.context.detach()` catches and logs at ERROR ("Failed to detach
+    context"). A previous version of `_stream_with_keepalive` created a fresh
+    `asyncio.Task` for every upstream item (`asyncio.ensure_future` after each
+    successful `__anext__`), tripping this twice per streaming request — once for
+    each of the two nested spans above. Pumping `source` from one task, start to
+    finish, keeps every attach/detach pair inside that task's own context.
+
+    A `CancelledError` raised by `source` itself (as opposed to this task being
+    cancelled from the outside, e.g. by `_stream_with_keepalive`'s cleanup on
+    close) is relayed like any other exception: `Task.cancelling()` is 0 in that
+    case, since nothing called `.cancel()` on this task. When this task *was*
+    cancelled from the outside, `cancelling()` is nonzero and the error is
+    re-raised untouched instead of being queued — the consumer has already
+    stopped reading by then, so queuing it could block forever on a full queue.
+    """
+    try:
+        async for item in source:
+            await queue.put(item)
+    except asyncio.CancelledError as exc:
+        pump_task = asyncio.current_task()
+        if pump_task is not None and pump_task.cancelling() > 0:
+            raise
+        await queue.put(_StreamError(exc))
+        return
+    except Exception as exc:
+        await queue.put(_StreamError(exc))
+        return
+    await queue.put(_STREAM_DONE)
+
+
+async def _stream_with_keepalive(
+    source: AsyncIterator[AnthropicPolicyEmission],
+    interval_seconds: float,
+) -> AsyncIterator["AnthropicPolicyEmission | _Keepalive"]:
+    """Yield from `source`, injecting a `_KEEPALIVE` sentinel on slow items.
+
+    A keepalive is injected whenever the next item takes longer than
+    `interval_seconds` to arrive.
+
+    `source` is pumped by a single background task for its entire lifetime (see
+    `_pump_to_queue` for why a fresh task per item is unsafe here). The one-slot
+    queue means the pump is never more than one item ahead of what this generator
+    has yielded, so a slow item is never dropped: the timeout only triggers a
+    keepalive and we keep waiting on the same queue. The pump task is cancelled
+    on close.
+    """
+    queue: "asyncio.Queue[object]" = asyncio.Queue(maxsize=1)
+    pump = asyncio.ensure_future(_pump_to_queue(source, queue))
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), interval_seconds)
+            except asyncio.TimeoutError:
+                yield _KEEPALIVE
+                continue
+            if item is _STREAM_DONE:
+                return
+            if isinstance(item, _StreamError):
+                raise item.exc
+            yield cast("AnthropicPolicyEmission", item)
+    finally:
+        if not pump.done():
+            pump.cancel()
+            try:
+                await pump
+            except BaseException:
+                pass
 
 
 class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
@@ -110,10 +233,19 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         user_id: str | None,
         request_log_recorder: RequestLogRecorder,
         is_streaming: bool,
+        client_request_unmodified: bool,
+        credential_passthrough: bool,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         self._request = initial_request
-        self._initial_request = initial_request
+        # Deep-copied: policies are allowed to mutate the request dict
+        # in-place (see the identical rationale on _first_backend_response
+        # below) rather than replacing it via set_request(). A live
+        # reference here would silently "see" that mutation too, corrupting
+        # both this snapshot and the provenance check in
+        # _tag_request_provenance, which compares the request actually sent
+        # upstream against this value to detect policy-side modification.
+        self._initial_request = copy.deepcopy(initial_request)
         self._anthropic_client = anthropic_client
         self._emitter = emitter
         self._call_id = call_id
@@ -122,6 +254,19 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         self._request_log_recorder = request_log_recorder
         self._is_streaming = is_streaming
         self._extra_headers = extra_headers
+        # Whether the pipeline had already changed the request/headers before
+        # policy hooks ever ran (context injection, UPSTREAM_HEADERS) — see
+        # process_anthropic_request. Combined with the initial_request
+        # comparison in _tag_provenance to decide passthrough provenance for
+        # Sentry (see observability/sentry.py:PASSTHROUGH_TAG).
+        self._client_request_unmodified = client_request_unmodified
+        # Whether the credential forwarded upstream is the client's own
+        # (passthrough / x-anthropic-api-key auth) rather than the
+        # operator's shared ANTHROPIC_API_KEY substituted in client-key auth
+        # mode — see process_anthropic_request. A 401 caused by an invalid
+        # *operator* credential must never be tagged CREDENTIAL_PASSTHROUGH_TAG
+        # just because the request body was untouched.
+        self._credential_passthrough = credential_passthrough
         self._request_recorded = False
         self._first_backend_response: AnthropicResponse | None = None
         # Raw backend events are only buffered when needed for non-streaming
@@ -182,10 +327,27 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
             endpoint="/v1/messages",
         )
 
+    def _tag_request_provenance(self, final_request: AnthropicRequest) -> None:
+        """Tag the Sentry scope with the request and credential provenance.
+
+        `self._client_request_unmodified` covers pipeline-level changes made
+        before any policy hook ran (context injection, UPSTREAM_HEADERS);
+        comparing `final_request` against the pre-hook snapshot
+        (`self._initial_request`) covers what a policy hook did to it. Both
+        must hold for PASSTHROUGH_TAG (body/headers untouched). Credential
+        provenance is tagged separately via CREDENTIAL_PASSTHROUGH_TAG since
+        a bad body/model name (400/404) is credential-independent — only a
+        401 needs both tags true (see observability/sentry.py).
+        """
+        unmodified = self._client_request_unmodified and final_request == self._initial_request
+        tag_request_provenance(unmodified)
+        tag_credential_provenance(self._credential_passthrough)
+
     async def complete(self, request: AnthropicRequest | None = None) -> AnthropicResponse:
         """Execute a non-streaming backend request."""
         final_request = request or self._request
         self._record_backend_request(final_request)
+        self._tag_request_provenance(final_request)
 
         with tracer.start_as_current_span("send_upstream") as span:
             span.set_attribute("luthien.phase", "send_upstream")
@@ -200,6 +362,7 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         """Execute a streaming backend request."""
         final_request = request or self._request
         self._record_backend_request(final_request)
+        self._tag_request_provenance(final_request)
 
         extra_headers = self._extra_headers
 
@@ -424,13 +587,29 @@ async def process_anthropic_request(
 
         # Expand configurable upstream headers (e.g. Helicone session/auth headers).
         # Templates in UPSTREAM_HEADERS env var are expanded with per-request context.
-        forwarded_headers = merge_forwarded_headers(
-            base=forwarded_headers,
-            upstream=expand_upstream_headers(
-                session_id=session_id,
-                request_path=raw_http_request.path,
-            ),
+        upstream_injected_headers = expand_upstream_headers(
+            session_id=session_id,
+            request_path=raw_http_request.path,
         )
+        forwarded_headers = merge_forwarded_headers(base=forwarded_headers, upstream=upstream_injected_headers)
+
+        # Passthrough provenance so far (before policy hooks run): true only
+        # when neither policy-context injection (above) nor an
+        # operator-configured upstream header changed anything the client
+        # didn't itself send. `anthropic-beta` forwarding doesn't count
+        # against this — it relays a header the client already set, verbatim.
+        # _AnthropicPolicyIO combines this with what happens in policy hooks
+        # to decide the final Sentry PASSTHROUGH_TAG (observability/sentry.py).
+        client_request_unmodified = anthropic_request == raw_http_request.body and not upstream_injected_headers
+
+        # Whether the credential Anthropic will see is the client's own, not
+        # the operator's shared ANTHROPIC_API_KEY. resolve_anthropic_client
+        # (gateway_routes.py) passes `user_credential=None` exactly when a
+        # client-key-mode request matched the shared key and the server's own
+        # base_client/credential is forwarded instead — that branch is never
+        # a client passthrough no matter how untouched the body is, since a
+        # 401 there means the *operator's* credential is invalid.
+        credential_passthrough = user_credential is not None
 
         # Create policy cache factory if database is available. The cap is
         # configured once here so every policy's cache honors the same limit;
@@ -466,6 +645,8 @@ async def process_anthropic_request(
             is_streaming=is_streaming,
             root_span=root_span,
             request_log_recorder=request_log_recorder,
+            client_request_unmodified=client_request_unmodified,
+            credential_passthrough=credential_passthrough,
             extra_headers=forwarded_headers,
             usage_collector=usage_collector,
             webhook_sender=webhook_sender,
@@ -510,7 +691,9 @@ async def _process_request(
         try:
             body = await request.json()
         except json.JSONDecodeError as e:
-            logger.error(f"[{call_id}] Malformed JSON in Anthropic request: {repr(e)}")
+            # Client sent invalid JSON — not a proxy defect (LUTHIEN-7/9); the
+            # 400 below is the actionable response to the client.
+            logger.warning(f"[{call_id}] Malformed JSON in Anthropic request: {repr(e)}")
             raise HTTPException(status_code=400, detail="Invalid JSON in request body")
         headers = {k.lower(): v for k, v in request.headers.items()}
 
@@ -620,6 +803,8 @@ async def _execute_anthropic_policy(
     root_span: Span,
     request_log_recorder: RequestLogRecorder,
     request_start_time: float,
+    client_request_unmodified: bool,
+    credential_passthrough: bool,
     extra_headers: dict[str, str] | None = None,
     usage_collector: UsageCollector | None = None,
     webhook_sender: WebhookSender | None = None,
@@ -634,6 +819,8 @@ async def _execute_anthropic_policy(
         user_id=policy_ctx.user_id,
         request_log_recorder=request_log_recorder,
         is_streaming=is_streaming,
+        client_request_unmodified=client_request_unmodified,
+        credential_passthrough=credential_passthrough,
         extra_headers=extra_headers,
     )
     emissions = _run_policy_hooks(execution_policy, io, policy_ctx)
@@ -748,13 +935,28 @@ async def _handle_execution_streaming(
                 caught_exception = False
                 try:
                     with tracer.start_as_current_span("policy_execute"):
-                        async for emitted in emissions:
+                        async for emitted in _stream_with_keepalive(emissions, STREAM_KEEPALIVE_SECONDS):
+                            if isinstance(emitted, _Keepalive):
+                                # Upstream gap: forward an Anthropic-style ping so
+                                # the connection doesn't idle out mid-generation.
+                                # Only after message_start (emitted_any) so the
+                                # wire event ordering stays intact.
+                                if emitted_any:
+                                    yield _KEEPALIVE_SSE
+                                continue
                             if _is_anthropic_response_emission(emitted):
                                 raise TypeError(
                                     "Streaming Anthropic execution policies must emit streaming events, "
                                     "not full response objects."
                                 )
                             io.ensure_request_recorded()
+                            if not emitted_any:
+                                first_event_ms = int((time.monotonic() - request_start_time) * 1000)
+                                response_span.set_attribute(
+                                    "luthien.stream.first_event_ms",
+                                    first_event_ms,
+                                )
+                                stream_first_event_histogram.record(first_event_ms)
                             emitted_any = True
                             cast_emitted = cast(MessageStreamEvent, emitted)
                             accumulated_events.append(cast_emitted)
@@ -791,7 +993,14 @@ async def _handle_execution_streaming(
                     )
                     if isinstance(e, AnthropicStatusError):
                         final_status = e.status_code or 500
-                    elif isinstance(e, AnthropicConnectionError):
+                    elif isinstance(e, AnthropicConnectionError | AnthropicUpstreamTransportError):
+                        # AnthropicUpstreamTransportError is AnthropicClient's own
+                        # wrapper around a network-level transport failure talking
+                        # to Anthropic (see llm/anthropic_client.py) — same
+                        # upstream-network bucket as AnthropicConnectionError, not
+                        # a proxy defect. Without this branch it fell through to
+                        # the generic 500 below, misclassifying an upstream outage
+                        # as a proxy bug in the completion webhook / request log.
                         final_status = 503
                     else:
                         final_status = 500
@@ -1167,16 +1376,19 @@ def _format_sse_event(event: MessageStreamEvent | _StreamErrorEvent) -> str:
 
     The client uses messages.create(stream=True), which yields only raw
     wire-protocol events — no synthetic SDK convenience events to filter.
-    model_dump() faithfully reproduces whatever the API sent, including any
-    new fields the SDK hasn't added to model_fields yet, making the proxy
-    as transparent as a direct connection.
+    model_dump(mode="json") faithfully reproduces whatever the API sent,
+    including any new fields the SDK hasn't added to model_fields yet, making
+    the proxy as transparent as a direct connection. JSON mode matters: some
+    wire fields are non-primitive in the SDK models (e.g. the code-execution
+    container's `expires_at` is a datetime), and python-mode dumps of those
+    crash json.dumps mid-stream.
     """
     if isinstance(event, dict):
         event_type = str(event.get("type", "unknown"))
         event_data: dict = dict(event)
     else:
         event_type = event.type
-        event_data = event.model_dump()
+        event_data = event.model_dump(mode="json")
 
     json_data = json.dumps(event_data)
     return f"event: {event_type}\ndata: {json_data}\n\n"
@@ -1203,6 +1415,17 @@ def _build_error_event(e: Exception, call_id: str) -> _StreamErrorEvent:
         error_type = "api_connection_error"
         message = client_error_detail(str(e), "An error occurred while connecting to the API.")
         logger.warning(f"[{call_id}] Mid-stream Anthropic connection error: {repr(e)}")
+    elif isinstance(e, AnthropicUpstreamTransportError):
+        # Raised by AnthropicClient.complete/stream when the actual upstream
+        # connection drops (e.g. RemoteProtocolError, ReadTimeout, ReadError
+        # while mid-read of a streaming response body) — the backend's
+        # network, not a proxy defect (LUTHIEN-A/B/G). A raw
+        # httpx.TransportError raised anywhere else (e.g. a policy's own
+        # outbound call) is NOT this type and falls to the generic branch
+        # below, where it stays error-level and visible.
+        error_type = "api_connection_error"
+        message = client_error_detail(str(e), "An error occurred while connecting to the API.")
+        logger.warning(f"[{call_id}] Mid-stream transport error: {repr(e)}")
     else:
         error_type = "api_error"
         message = client_error_detail(str(e), "An internal error occurred while processing the request.")
@@ -1271,6 +1494,18 @@ def _handle_anthropic_error(e: Exception, call_id: str) -> None:
         ) from e
     elif isinstance(e, AnthropicConnectionError):
         logger.warning(f"[{call_id}] Anthropic connection error: {repr(e)}")
+        raise BackendAPIError(
+            status_code=502,
+            message=client_error_detail(str(e), "An error occurred while connecting to the API."),
+            error_type="api_connection_error",
+            client_format=ClientFormat.ANTHROPIC,
+            provider="anthropic",
+        ) from e
+    elif isinstance(e, AnthropicUpstreamTransportError):
+        # Same upstream-network carve-out as _build_error_event's mid-stream
+        # branch, for the non-streaming path — previously this fell through
+        # to "let them propagate" and surfaced as an unclassified 500.
+        logger.warning(f"[{call_id}] Anthropic upstream transport error: {repr(e)}")
         raise BackendAPIError(
             status_code=502,
             message=client_error_detail(str(e), "An error occurred while connecting to the API."),

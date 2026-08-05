@@ -2,9 +2,13 @@
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import logging
+import time
+from collections.abc import AsyncIterator, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import opentelemetry.metrics._internal as metrics_internal
 import pytest
 from anthropic import APIConnectionError as AnthropicConnectionError
 from anthropic import APIStatusError as AnthropicStatusError
@@ -23,11 +27,21 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from httpx import Request as HttpxRequest
 from httpx import Response as HttpxResponse
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from tests.constants import DEFAULT_TEST_MODEL
 from tests.luthien_proxy.fixtures.policy_context import make_policy_context
 
+from luthien_proxy.credentials import Credential, CredentialType
 from luthien_proxy.exceptions import BackendAPIError
+from luthien_proxy.llm.anthropic_client import AnthropicUpstreamTransportError
 from luthien_proxy.llm.types.anthropic import AnthropicRequest, AnthropicResponse, build_usage
+from luthien_proxy.pipeline import anthropic_processor as anthropic_processor_mod
 from luthien_proxy.pipeline.anthropic_processor import (
     _AnthropicPolicyIO,
     _build_error_event,
@@ -43,6 +57,60 @@ from luthien_proxy.policy_core.anthropic_execution_interface import (
     AnthropicPolicyEmission,
 )
 from luthien_proxy.policy_core.policy_context import PolicyContext
+
+
+def _metric_point(reader: InMemoryMetricReader, metric_name: str):
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    return metric.data.data_points[0]
+    raise AssertionError(f"metric {metric_name!r} was not recorded")
+
+
+@pytest.fixture
+def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    """Route `anthropic_processor`'s module-level tracer to an in-memory exporter."""
+    previous_provider = trace._TRACER_PROVIDER
+    previous_once_done = trace._TRACER_PROVIDER_SET_ONCE._done
+    trace._TRACER_PROVIDER_SET_ONCE._done = False
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    monkeypatch.setattr(
+        anthropic_processor_mod,
+        "tracer",
+        provider.get_tracer(anthropic_processor_mod.__name__),
+    )
+
+    try:
+        yield exporter
+    finally:
+        provider.shutdown()
+        trace._TRACER_PROVIDER = previous_provider
+        trace._TRACER_PROVIDER_SET_ONCE._done = previous_once_done
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[InMemoryMetricReader]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once_done = metrics_internal._METER_PROVIDER_SET_ONCE._done
+    metrics_internal._METER_PROVIDER_SET_ONCE._done = False
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+
+    try:
+        yield reader
+    finally:
+        provider.shutdown()
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE._done = previous_once_done
 
 
 class TestFormatSSEEvent:
@@ -132,6 +200,35 @@ class TestFormatSSEEvent:
         data = json.loads(result.split("data: ", 1)[1].strip())
         assert data["new_api_field"] == 42
         assert data["type"] == "content_block_delta"
+
+    def test_serializes_container_expires_at_datetime(self):
+        """message_start events carry message.container.expires_at as a datetime
+        when the response used the code-execution tool. model_dump() in python
+        mode leaves it as a datetime object, which json.dumps rejects — killing
+        live streams mid-flight with TypeError('Object of type datetime is not
+        JSON serializable'). Every emitted value must be JSON-serializable."""
+        event = RawMessageStartEvent.model_validate(
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_123",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": DEFAULT_TEST_MODEL,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                    "container": {"id": "container_abc", "expires_at": "2026-08-12T11:14:56Z"},
+                },
+            }
+        )
+        result = _format_sse_event(event)
+
+        data = json.loads(result.split("data: ", 1)[1].strip())
+        expires_at = data["message"]["container"]["expires_at"]
+        assert isinstance(expires_at, str)
+        assert expires_at.startswith("2026-08-12T11:14:56")
 
 
 class TestProcessRequest:
@@ -315,11 +412,14 @@ class TestProcessRequest:
         assert "payload too large" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_malformed_json_returns_400(self, mock_request, mock_emitter, mock_span):
+    async def test_malformed_json_returns_400(self, mock_request, mock_emitter, mock_span, caplog):
         """Test that malformed JSON in request body returns 400 error."""
         mock_request.json = AsyncMock(side_effect=json.JSONDecodeError("Expecting value", "", 0))
 
-        with patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer:
+        with (
+            patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer,
+            caplog.at_level(logging.WARNING, logger="luthien_proxy.pipeline.anthropic_processor"),
+        ):
             mock_tracer.start_as_current_span.return_value.__enter__ = MagicMock(return_value=mock_span)
             mock_tracer.start_as_current_span.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -332,6 +432,11 @@ class TestProcessRequest:
 
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid JSON in request body"
+        # A client sending malformed JSON is not a proxy defect — must not be
+        # error-level, or Sentry's logging integration captures it (LUTHIEN-7/9).
+        malformed_json_records = [r for r in caplog.records if "Malformed JSON" in r.message]
+        assert malformed_json_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.WARNING for r in malformed_json_records)
 
     @pytest.mark.asyncio
     async def test_missing_model_returns_400(self, mock_request, mock_emitter, mock_span):
@@ -647,6 +752,85 @@ class TestProcessAnthropicRequest:
         mock_anthropic_client.complete.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_client_key_mode_tags_credential_passthrough_false_despite_unmodified_body(
+        self, mock_request, mock_policy, mock_anthropic_client, mock_emitter
+    ):
+        """Route-level regression for the PR #809 credential-provenance finding.
+
+        In client-key auth mode, resolve_anthropic_client (gateway_routes.py)
+        forwards the request with `user_credential=None` — the server's own
+        ANTHROPIC_API_KEY is used, not anything the client sent. Even with a
+        byte-identical, unmodified body, CREDENTIAL_PASSTHROUGH_TAG must be
+        False: an upstream 401 here means the *operator's* credential is
+        invalid, and dropping it from Sentry would silently hide the outage.
+        PASSTHROUGH_TAG (body/header provenance) is unaffected and still
+        tags True, since the body genuinely was untouched — 400/404 noise
+        reduction for client-key deployments must not regress.
+        """
+        anthropic_body = {
+            "model": DEFAULT_TEST_MODEL,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 1024,
+            "stream": False,
+        }
+        mock_request.json = AsyncMock(return_value=anthropic_body)
+
+        with (
+            patch("luthien_proxy.pipeline.anthropic_processor.tracer"),
+            patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_body_tag,
+            patch("luthien_proxy.pipeline.anthropic_processor.tag_credential_provenance") as mock_cred_tag,
+        ):
+            await process_anthropic_request(
+                request=mock_request,
+                policy=mock_policy,
+                anthropic_client=mock_anthropic_client,
+                emitter=mock_emitter,
+                user_credential=None,
+            )
+
+        mock_body_tag.assert_called_once_with(True)
+        mock_cred_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_passthrough_mode_with_unmodified_body_tags_both_true(
+        self, mock_request, mock_policy, mock_anthropic_client, mock_emitter
+    ):
+        """Sanity check: an unmodified body forwarded with the client's own
+        credential (passthrough / BOTH auth mode) is still a genuine
+        passthrough and must tag both PASSTHROUGH_TAG and
+        CREDENTIAL_PASSTHROUGH_TAG true — the credential check must not
+        overcorrect into always tagging False.
+        """
+        anthropic_body = {
+            "model": DEFAULT_TEST_MODEL,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 1024,
+            "stream": False,
+        }
+        mock_request.json = AsyncMock(return_value=anthropic_body)
+        client_credential = Credential(
+            value="sk-ant-client-token",
+            credential_type=CredentialType.API_KEY,
+            platform="anthropic",
+        )
+
+        with (
+            patch("luthien_proxy.pipeline.anthropic_processor.tracer"),
+            patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_body_tag,
+            patch("luthien_proxy.pipeline.anthropic_processor.tag_credential_provenance") as mock_cred_tag,
+        ):
+            await process_anthropic_request(
+                request=mock_request,
+                policy=mock_policy,
+                anthropic_client=mock_anthropic_client,
+                emitter=mock_emitter,
+                user_credential=client_credential,
+            )
+
+        mock_body_tag.assert_called_once_with(True)
+        mock_cred_tag.assert_called_once_with(True)
+
+    @pytest.mark.asyncio
     async def test_emits_transaction_request_recorded(
         self, mock_request, mock_policy, mock_anthropic_client, mock_emitter
     ):
@@ -843,6 +1027,41 @@ class TestBuildErrorEvent:
         assert event.get("error", {}).get("type") == "api_connection_error"
         assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
 
+    def test_builds_transport_error_event_and_logs_at_warning(self, caplog):
+        """AnthropicUpstreamTransportError — raised by AnthropicClient when the
+        actual upstream connection drops mid-stream — is the backend's network,
+        not a proxy defect (LUTHIEN-A/B/G) — must log at warning, not error."""
+        error = AnthropicUpstreamTransportError(
+            "peer closed connection without sending complete message body (incomplete chunked read)"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="luthien_proxy.pipeline.anthropic_processor"):
+            event = _build_error_event(error, "test-call-id")
+
+        assert event.get("type") == "error"
+        assert event.get("error", {}).get("type") == "api_connection_error"
+        assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
+        transport_records = [r for r in caplog.records if "Mid-stream transport error" in r.message]
+        assert transport_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.WARNING for r in transport_records)
+
+    def test_builds_generic_error_event_for_policy_origin_transport_error(self, caplog):
+        """A raw httpx.TransportError NOT raised by AnthropicClient (e.g. from a
+        policy's own outbound HTTP call) is not AnthropicUpstreamTransportError,
+        so it must stay on the generic error-level path — the upstream-network
+        carve-out must not swallow a policy/gateway bug (thermonuclear-deep-review
+        finding on PR #814)."""
+        mock_request = HttpxRequest("POST", "https://example.com/judge")
+        error = httpx.RemoteProtocolError("peer closed connection", request=mock_request)
+
+        with caplog.at_level(logging.ERROR, logger="luthien_proxy.pipeline.anthropic_processor"):
+            event = _build_error_event(error, "test-call-id")
+
+        assert event.get("error", {}).get("type") == "api_error"
+        error_records = [r for r in caplog.records if "Mid-stream error" in r.message]
+        assert error_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in error_records)
+
     def test_builds_generic_error_event(self):
         """Generic exceptions produce a sanitized error event — internal details are not forwarded."""
         error = RuntimeError("Something went wrong")
@@ -852,6 +1071,18 @@ class TestBuildErrorEvent:
         assert event.get("type") == "error"
         assert event.get("error", {}).get("type") == "api_error"
         assert event.get("error", {}).get("message") == "An internal error occurred while processing the request."
+
+    def test_builds_generic_error_event_logs_at_error(self, caplog):
+        """A genuine proxy bug mid-stream must still be error-level and visible —
+        the httpx.TransportError carve-out must not swallow real defects."""
+        error = RuntimeError("Something went wrong")
+
+        with caplog.at_level(logging.ERROR, logger="luthien_proxy.pipeline.anthropic_processor"):
+            _build_error_event(error, "test-call-id")
+
+        error_records = [r for r in caplog.records if "Mid-stream error" in r.message]
+        assert error_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in error_records)
 
 
 class TestMidStreamErrorHandling:
@@ -1096,6 +1327,20 @@ class TestHandleAnthropicError:
     def test_connection_error_raises_backend_api_error(self):
         """Connection errors should raise BackendAPIError with 502."""
         exc = AnthropicConnectionError(request=HttpxRequest("POST", "https://api.anthropic.com/v1/messages"))
+
+        with pytest.raises(BackendAPIError) as exc_info:
+            _handle_anthropic_error(exc, "test-call")
+
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_type == "api_connection_error"
+
+    def test_upstream_transport_error_raises_backend_api_error(self):
+        """AnthropicUpstreamTransportError (raised by AnthropicClient when the
+        actual upstream connection drops) should raise BackendAPIError with 502
+        — previously this exception type wasn't classified at all in the
+        non-streaming path and propagated as an unclassified 500
+        (thermonuclear-deep-review finding on PR #814)."""
+        exc = AnthropicUpstreamTransportError("peer closed connection")
 
         with pytest.raises(BackendAPIError) as exc_info:
             _handle_anthropic_error(exc, "test-call")
@@ -2084,6 +2329,8 @@ class TestAnthropicPolicyIOBuffering:
             user_id=None,
             request_log_recorder=MagicMock(),
             is_streaming=is_streaming,
+            client_request_unmodified=True,
+            credential_passthrough=True,
         )
 
     def test_buffer_raw_events_false_when_streaming(self):
@@ -2120,6 +2367,169 @@ class TestAnthropicPolicyIOBuffering:
 
         raw_events = accumulated_events if not io._buffer_raw_events else io._raw_backend_events
         assert raw_events is io._raw_backend_events
+
+
+class TestAnthropicPolicyIORequestProvenance:
+    """Tests for _AnthropicPolicyIO tagging Sentry with request/credential provenance.
+
+    Covers PR #809 finding: 400/404 from Anthropic must only be treated as
+    "expected" (dropped from Sentry) when the request that reached Anthropic is
+    provably what the client sent — see observability/sentry.py:PASSTHROUGH_TAG.
+    Also covers the follow-up finding that PASSTHROUGH_TAG alone is not enough
+    for a 401: in client-key auth mode the *credential* forwarded upstream is
+    the operator's own ANTHROPIC_API_KEY rather than anything the client sent,
+    so CREDENTIAL_PASSTHROUGH_TAG is tagged separately and must NOT gate
+    400/404 (which are credential-independent, and were PR #809's original
+    noise-reduction target for client-key deployments).
+    """
+
+    def _make_io(
+        self,
+        *,
+        request: AnthropicRequest,
+        client_request_unmodified: bool = True,
+        credential_passthrough: bool = True,
+    ) -> _AnthropicPolicyIO:
+        return _AnthropicPolicyIO(
+            initial_request=request,
+            anthropic_client=MagicMock(),
+            emitter=MagicMock(),
+            call_id="test-call",
+            session_id=None,
+            user_id=None,
+            request_log_recorder=MagicMock(),
+            is_streaming=False,
+            client_request_unmodified=client_request_unmodified,
+            credential_passthrough=credential_passthrough,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmodified_request_tags_passthrough_true(self):
+        """A request nothing touched must tag True."""
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(request)
+
+        mock_tag.assert_called_once_with(True)
+
+    @pytest.mark.asyncio
+    async def test_policy_replaced_request_tags_passthrough_false(self):
+        """A policy hook returning a different request object must tag False."""
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        replaced_request: AnthropicRequest = {**request, "max_tokens": 999}
+        io.set_request(replaced_request)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(replaced_request)
+
+        mock_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_policy_mutated_request_in_place_tags_passthrough_false(self):
+        """A policy hook mutating the SAME dict in place (rather than replacing
+        it) must still be detected — _initial_request is a deep copy exactly to
+        guard against this aliasing corrupting the comparison (matches
+        _AddMaxTokensPolicy's mutate-and-return style in TestRunPolicyHooks).
+        """
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        request["max_tokens"] = 999
+        io.set_request(request)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(request)
+
+        mock_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_pipeline_level_modification_tags_passthrough_false_even_if_hooks_are_noop(self):
+        """client_request_unmodified=False (context injection / UPSTREAM_HEADERS
+        happened before hooks ran) must tag False even when no policy hook
+        changes anything further.
+        """
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request, client_request_unmodified=False)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(request)
+
+        mock_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_client_key_mode_tags_credential_passthrough_false_even_if_body_unmodified(self):
+        """credential_passthrough=False (client-key auth mode, server's shared
+        ANTHROPIC_API_KEY forwarded instead of anything the client sent) must
+        tag CREDENTIAL_PASSTHROUGH_TAG False even when the body and headers
+        are completely untouched — an upstream 401 in that mode means the
+        *operator's* credential is invalid, not the client's, and must not be
+        dropped from Sentry. PASSTHROUGH_TAG (body/header provenance) is
+        unaffected and still tags True, since the body genuinely was
+        untouched.
+        """
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request, credential_passthrough=False)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        with (
+            patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_body_tag,
+            patch("luthien_proxy.pipeline.anthropic_processor.tag_credential_provenance") as mock_cred_tag,
+        ):
+            await io.complete(request)
+
+        mock_body_tag.assert_called_once_with(True)
+        mock_cred_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_stream_tags_passthrough_based_on_same_rules(self):
+        """stream() must apply the identical provenance rule as complete()."""
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+        io = self._make_io(request=request)
+
+        async def _fake_stream(req, extra_headers=None):
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        io._anthropic_client.stream = _fake_stream
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            async for _ in io.stream(request):
+                pass
+
+        mock_tag.assert_called_once_with(True)
 
 
 class TestStreamingWebhookGate:
@@ -2199,6 +2609,64 @@ class TestStreamingWebhookGate:
         assert kwargs["is_streaming"] is True
 
     @pytest.mark.asyncio
+    async def test_first_stream_event_sets_span_attribute(
+        self,
+        span_exporter: InMemorySpanExporter,
+    ):
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        async def emissions():
+            yield self._make_event()
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-first-event",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            request_start_time=time.monotonic() - 0.01,
+        )
+
+        await self._drain(response)
+
+        spans = {span.name: span for span in span_exporter.get_finished_spans()}
+        attrs = spans["process_response"].attributes
+        assert attrs is not None
+        assert isinstance(attrs["luthien.stream.first_event_ms"], int)
+        assert attrs["luthien.stream.first_event_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_first_stream_event_records_histogram(
+        self,
+        metric_reader: InMemoryMetricReader,
+    ):
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        async def emissions():
+            yield self._make_event()
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-first-event-metric",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            request_start_time=time.monotonic() - 0.01,
+        )
+
+        await self._drain(response)
+
+        point = _metric_point(metric_reader, "luthien.stream.first_event_ms")
+        assert point.count == 1
+        assert point.sum >= 0
+
+    @pytest.mark.asyncio
     async def test_mid_stream_exception_fires_with_success_false(self):
         """Policy raises mid-stream → webhook fires with success=False, http_status=500."""
         from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
@@ -2229,6 +2697,57 @@ class TestStreamingWebhookGate:
         kwargs = webhook.fire_and_forget.call_args.kwargs
         assert kwargs["success"] is False
         assert kwargs["http_status"] == 500
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_upstream_transport_error_fires_with_503(self):
+        """AnthropicUpstreamTransportError mid-stream → error event classified as
+        api_connection_error, webhook AND request-log status 503 — the same
+        upstream-network bucket as AnthropicConnectionError, not a proxy 500.
+
+        Regression for the finding that this exception type fell through to
+        the generic `else: final_status = 500` branch, misclassifying an
+        Anthropic-side network outage as a proxy bug in the completion
+        webhook and request-log rows.
+        """
+        from luthien_proxy.llm.anthropic_client import AnthropicUpstreamTransportError
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        transport_error = AnthropicUpstreamTransportError("peer closed connection without sending complete message")
+
+        async def emissions():
+            yield self._make_event()
+            raise transport_error
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        webhook = MagicMock()
+        webhook.enabled = True
+        webhook.fire_and_forget = MagicMock()
+
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-transport-error",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            webhook_sender=webhook,
+            request_start_time=0.0,
+        )
+        chunks = await self._drain(response)
+
+        # Emitted error event is classified as api_connection_error (_build_error_event).
+        body_text = b"".join(chunks).decode()
+        assert "event: error" in body_text
+        assert '"type": "api_connection_error"' in body_text
+
+        # Webhook AND request-log both record the upstream-network status, not 500.
+        webhook.fire_and_forget.assert_called_once()
+        kwargs = webhook.fire_and_forget.call_args.kwargs
+        assert kwargs["success"] is False
+        assert kwargs["http_status"] == 503
+        recorder.record_inbound_response.assert_called_once_with(status=503)
+        recorder.record_outbound_response.assert_called_once_with(status=503)
 
     @pytest.mark.asyncio
     async def test_empty_stream_fires_with_success_false_500(self):
@@ -2736,3 +3255,136 @@ class TestWebhookFireIsolation:
 
         webhook.fire_and_forget.assert_called_once()
         recorder.flush.assert_called()  # cleanup completed despite webhook failure
+
+
+class TestStreamWithKeepalive:
+    """`_stream_with_keepalive` injects SSE keepalives during upstream gaps without
+    dropping or reordering real events. Regression: the Anthropic SDK drops upstream
+    `ping` events, so a long silent generation idled out at the ALB timeout."""
+
+    async def test_injects_keepalive_during_gap(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        async def source():
+            yield "A"
+            await asyncio.sleep(0.12)  # > interval -> keepalives expected in this gap
+            yield "B"
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+        reals = [x for x in out if not isinstance(x, _Keepalive)]
+        keepalives = [x for x in out if isinstance(x, _Keepalive)]
+        assert reals == ["A", "B"]  # order preserved, nothing dropped
+        assert len(keepalives) >= 1  # the gap produced at least one keepalive
+        assert out[0] == "A" and out[-1] == "B"  # keepalives sit between real events
+
+    async def test_no_keepalive_when_fast(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        async def source():
+            yield "A"
+            yield "B"
+            yield "C"
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.5)]
+        assert out == ["A", "B", "C"]
+        assert not any(isinstance(x, _Keepalive) for x in out)
+
+    async def test_empty_source_terminates(self):
+        from luthien_proxy.pipeline.anthropic_processor import _stream_with_keepalive
+
+        async def source():
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+        assert out == []
+
+    async def test_close_cancels_pending(self):
+        from luthien_proxy.pipeline.anthropic_processor import (
+            _Keepalive,
+            _stream_with_keepalive,
+        )
+
+        cancelled = asyncio.Event()
+
+        async def source():
+            yield "A"
+            try:
+                await asyncio.sleep(10)  # long-pending item, in flight at close
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            yield "B"  # pragma: no cover - never reached
+
+        gen = _stream_with_keepalive(source(), 0.02)
+        assert await gen.__anext__() == "A"
+        nxt = await gen.__anext__()  # pending sleep in flight -> keepalive
+        assert isinstance(nxt, _Keepalive)
+        await gen.aclose()  # must cancel the pending __anext__, not hang
+        await asyncio.sleep(0.01)
+        assert cancelled.is_set()
+
+    async def test_source_exception_propagates(self):
+        """An exception raised by `source` surfaces to the consumer, not just a hang.
+
+        `_pump_to_queue` catches it and hands it back through the queue as a
+        `_StreamError` sentinel; `_stream_with_keepalive` must unwrap and re-raise it.
+        """
+        from luthien_proxy.pipeline.anthropic_processor import _stream_with_keepalive
+
+        async def source():
+            yield "A"
+            raise RuntimeError("upstream exploded")
+
+        gen = _stream_with_keepalive(source(), 0.02)
+        assert await gen.__anext__() == "A"
+        with pytest.raises(RuntimeError, match="upstream exploded"):
+            await gen.__anext__()
+
+    async def test_span_spanning_multiple_yields_detaches_cleanly(
+        self,
+        span_exporter: InMemorySpanExporter,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Regression for the production `Failed to detach context` ERROR storm.
+
+        `AnthropicClient.stream()` and `_AnthropicPolicyIO._stream()` each hold a
+        span open across every chunk of the upstream response — exactly this
+        shape, reproduced directly against `_stream_with_keepalive` instead of the
+        full pipeline. A keepalive gap forces at least one wait-for-timeout cycle
+        mid-span, which used to move the underlying generator's `__anext__` onto a
+        fresh `asyncio.Task` (and therefore a fresh `contextvars.Context`) on every
+        item, so the span's `__exit__` detached a token created in a different
+        Context than the one it ran in. That raised `ValueError` inside
+        `opentelemetry.context.detach()`, which logs it rather than propagating it
+        — so the only observable symptom is the ERROR log line asserted against
+        below.
+        """
+        from luthien_proxy.pipeline import anthropic_processor as mod
+        from luthien_proxy.pipeline.anthropic_processor import _Keepalive, _stream_with_keepalive
+
+        async def source():
+            with mod.tracer.start_as_current_span("fake_upstream"):
+                yield "A"
+                await asyncio.sleep(0.12)  # > interval -> forces a keepalive mid-span
+                yield "B"
+
+        with caplog.at_level(logging.ERROR, logger="opentelemetry.context"):
+            out = [item async for item in _stream_with_keepalive(source(), 0.02)]
+
+        reals = [x for x in out if not isinstance(x, _Keepalive)]
+        assert reals == ["A", "B"]
+
+        failed_detaches = [r for r in caplog.records if "Failed to detach context" in r.message]
+        assert failed_detaches == []
+
+        finished = span_exporter.get_finished_spans()
+        assert len(finished) == 1
+        assert finished[0].name == "fake_upstream"
+        assert finished[0].status.status_code == StatusCode.UNSET
