@@ -3,7 +3,8 @@
 Layer 1 (EventScrubber): strips values by key name (api_key, token, etc.)
 Layer 2 (before_send hook): summarizes LLM content variables with type+length,
 strips cookies/server_name, redacts non-safe headers, and drops expected
-upstream provider errors.
+upstream provider errors and always-benign exception types (e.g. a client
+disconnecting mid-request).
 """
 
 from __future__ import annotations
@@ -155,6 +156,25 @@ _EXTRA_DENYLIST: list[str] = [
     "api_key_header",
 ]
 
+# Exceptions that always mean "the client went away," never a proxy defect,
+# identified by (module, type name) so an unrelated same-named class doesn't
+# match by accident. Matched against the *built* event's exception list
+# rather than hint["exc_info"]: a client disconnecting mid-body-read surfaces
+# through an anyio TaskGroup as an ExceptionGroup, and by the time before_send
+# runs the SDK has already flattened the group's members into
+# event["exception"]["values"] — hint["exc_info"][1] would still be the
+# outer ExceptionGroup, not the ClientDisconnect itself.
+_DROPPED_EXCEPTION_TYPES = frozenset({("starlette.requests", "ClientDisconnect")})
+
+# The (module, type) an ExceptionGroup/BaseExceptionGroup wrapper entry
+# carries in the flattened list — never a real failure by itself, just the
+# container for its members. Excluded when deciding whether "every exception
+# in this event is a dropped one": a mixed group like
+# ExceptionGroup(ClientDisconnect, RuntimeError) must still report, since
+# RuntimeError is a genuine proxy-side failure riding alongside the
+# disconnect, not something the carve-out should hide.
+_EXCEPTION_GROUP_TYPES = frozenset({"ExceptionGroup", "BaseExceptionGroup"})
+
 
 def _summarize(value: Any) -> Any:
     """Replace a value with its type and size, preserving debuggability."""
@@ -211,6 +231,13 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
         if _is_expected_upstream_error(exc_info[1], event.get("tags") or {}):
             return None
 
+    exception_values = event.get("exception", {}).get("values", [])
+    leaf_exceptions = [e for e in exception_values if e.get("type") not in _EXCEPTION_GROUP_TYPES]
+    if leaf_exceptions and all(
+        (exc_entry.get("module"), exc_entry.get("type")) in _DROPPED_EXCEPTION_TYPES for exc_entry in leaf_exceptions
+    ):
+        return None
+
     event.pop("server_name", None)
 
     request = event.get("request", {})
@@ -225,7 +252,7 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
         elif isinstance(request["data"], (str, list)):
             request["data"] = _summarize(request["data"])
 
-    for exc_entry in event.get("exception", {}).get("values", []):
+    for exc_entry in exception_values:
         for frame in exc_entry.get("stacktrace", {}).get("frames", []):
             frame_vars = frame.get("vars")
             if not frame_vars:
@@ -256,9 +283,20 @@ def init_sentry(settings: Settings | None = None) -> None:
         )
         return
 
-    # OTel exporter logs at ERROR when Tempo is unreachable — expected in
-    # local dev without Docker. Don't let these burn Sentry quota.
-    ignore_logger("opentelemetry.sdk.trace.export")
+    # OTel logs at ERROR for conditions that are its own concern, not ours:
+    # exporter/collector reachability (Tempo down in local dev, or the
+    # collector rejecting a batch — see LUTHIEN-C/F, which were `opentelemetry
+    # .exporter.otlp.proto.http.{trace,metric}_exporter` reporting HTTP 403
+    # from the OTel collector), and context-detach races on cross-task token
+    # resets during streaming (a ValueError OTel already catches and logs
+    # itself; the request is unaffected — this alone fired on ~every proxied
+    # request, ~86k events in 13h on 2026-08-05, and exhausted the org error
+    # quota). Telemetry-pipeline health is the collector's own monitors'
+    # job (see the Datadog monitor for luthien-proxy errors, which excludes
+    # `@logger:opentelemetry.*` for the same reason) — ignore the whole
+    # `opentelemetry.*` logger namespace here rather than chasing each
+    # sub-logger individually as new exporters/instrumentations add more.
+    ignore_logger("opentelemetry.*")
 
     sentry_sdk.init(
         dsn=settings.sentry_dsn,
