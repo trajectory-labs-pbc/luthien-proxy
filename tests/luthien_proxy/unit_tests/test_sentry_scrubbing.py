@@ -326,7 +326,8 @@ class TestBeforeSend:
         ):
             init_sentry(settings)
 
-        mock_ignore.assert_called_once_with("opentelemetry.sdk.trace.export")
+        ignored = {call.args[0] for call in mock_ignore.call_args_list}
+        assert ignored == {"opentelemetry.sdk.trace.export", "opentelemetry.context"}
 
 
 class TestSentryDisabledInTests:

@@ -34,7 +34,7 @@ from anthropic.lib.streaming import MessageStreamEvent
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.context import get_current
 from opentelemetry.trace import Span
 
@@ -94,6 +94,81 @@ class _StreamErrorEvent(TypedDict):
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+meter = metrics.get_meter(__name__)
+stream_first_event_histogram = meter.create_histogram(
+    "luthien.stream.first_event_ms",
+    unit="ms",
+    description="Time to first streamed event",
+)
+
+
+# --- Streaming keepalive ------------------------------------------------------
+# Anthropic's wire stream emits `ping` events during long generations to keep the
+# connection alive, but the Anthropic SDK's typed stream (messages.create(
+# stream=True)) drops them. Without re-injecting keepalives, a model that stays
+# silent for a long pre-content phase makes the proxy->client connection idle, and
+# an intermediary (e.g. the ALB idle timeout) cuts the stream mid-flight even
+# though the request is healthy. We emit an Anthropic-style `ping` whenever the
+# upstream produces no event within STREAM_KEEPALIVE_SECONDS.
+STREAM_KEEPALIVE_SECONDS = 15.0
+_KEEPALIVE_SSE = 'event: ping\ndata: {"type": "ping"}\n\n'
+_STREAM_DONE = object()
+
+
+class _Keepalive:
+    """Sentinel yielded by `_stream_with_keepalive` during an upstream gap."""
+
+
+_KEEPALIVE = _Keepalive()
+
+
+async def _anext_or_done(iterator: AsyncIterator[AnthropicPolicyEmission]) -> object:
+    """Return the next item, or the `_STREAM_DONE` sentinel when exhausted.
+
+    Converting StopAsyncIteration into a sentinel keeps it from propagating out of
+    the wrapped Task (and avoids PEP-479 surprises inside the async generator).
+    """
+    try:
+        return await iterator.__anext__()
+    except StopAsyncIteration:
+        return _STREAM_DONE
+
+
+async def _stream_with_keepalive(
+    source: AsyncIterator[AnthropicPolicyEmission],
+    interval_seconds: float,
+) -> AsyncIterator["AnthropicPolicyEmission | _Keepalive"]:
+    """Yield from `source`, injecting a `_KEEPALIVE` sentinel on slow items.
+
+    A keepalive is injected whenever the next item takes longer than
+    `interval_seconds` to arrive.
+
+    The in-flight `__anext__` is shielded from the per-wait timeout, so a slow item
+    is never dropped: the timeout only triggers a keepalive and we keep waiting on
+    the same pending item. The pending task is cancelled on close.
+    """
+    iterator = source.__aiter__()
+    pending: asyncio.Task[object] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(_anext_or_done(iterator))
+            try:
+                item = await asyncio.wait_for(asyncio.shield(pending), interval_seconds)
+            except asyncio.TimeoutError:
+                yield _KEEPALIVE
+                continue
+            pending = None
+            if item is _STREAM_DONE:
+                return
+            yield cast("AnthropicPolicyEmission", item)
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except BaseException:
+                pass
 
 
 class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
@@ -748,13 +823,28 @@ async def _handle_execution_streaming(
                 caught_exception = False
                 try:
                     with tracer.start_as_current_span("policy_execute"):
-                        async for emitted in emissions:
+                        async for emitted in _stream_with_keepalive(emissions, STREAM_KEEPALIVE_SECONDS):
+                            if isinstance(emitted, _Keepalive):
+                                # Upstream gap: forward an Anthropic-style ping so
+                                # the connection doesn't idle out mid-generation.
+                                # Only after message_start (emitted_any) so the
+                                # wire event ordering stays intact.
+                                if emitted_any:
+                                    yield _KEEPALIVE_SSE
+                                continue
                             if _is_anthropic_response_emission(emitted):
                                 raise TypeError(
                                     "Streaming Anthropic execution policies must emit streaming events, "
                                     "not full response objects."
                                 )
                             io.ensure_request_recorded()
+                            if not emitted_any:
+                                first_event_ms = int((time.monotonic() - request_start_time) * 1000)
+                                response_span.set_attribute(
+                                    "luthien.stream.first_event_ms",
+                                    first_event_ms,
+                                )
+                                stream_first_event_histogram.record(first_event_ms)
                             emitted_any = True
                             cast_emitted = cast(MessageStreamEvent, emitted)
                             accumulated_events.append(cast_emitted)
@@ -1167,16 +1257,19 @@ def _format_sse_event(event: MessageStreamEvent | _StreamErrorEvent) -> str:
 
     The client uses messages.create(stream=True), which yields only raw
     wire-protocol events — no synthetic SDK convenience events to filter.
-    model_dump() faithfully reproduces whatever the API sent, including any
-    new fields the SDK hasn't added to model_fields yet, making the proxy
-    as transparent as a direct connection.
+    model_dump(mode="json") faithfully reproduces whatever the API sent,
+    including any new fields the SDK hasn't added to model_fields yet, making
+    the proxy as transparent as a direct connection. JSON mode matters: some
+    wire fields are non-primitive in the SDK models (e.g. the code-execution
+    container's `expires_at` is a datetime), and python-mode dumps of those
+    crash json.dumps mid-stream.
     """
     if isinstance(event, dict):
         event_type = str(event.get("type", "unknown"))
         event_data: dict = dict(event)
     else:
         event_type = event.type
-        event_data = event.model_dump()
+        event_data = event.model_dump(mode="json")
 
     json_data = json.dumps(event_data)
     return f"event: {event_type}\ndata: {json_data}\n\n"
