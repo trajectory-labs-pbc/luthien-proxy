@@ -81,7 +81,9 @@ class Settings(_SettingsBase):
 
     # ── observability ───────────────────────────────────────────────
     otel_enabled: bool = False
+    observability_stdout_enabled: bool = True
     otel_exporter_otlp_endpoint: str = "http://tempo:4318/v1/traces"
+    otel_exporter_otlp_metrics_endpoint: str = "http://tempo:4318/v1/metrics"
     otel_exporter_otlp_protocol: str = "http/protobuf"
     tempo_url: str = "http://localhost:3200"
     service_name: str = "luthien-proxy"
@@ -89,6 +91,14 @@ class Settings(_SettingsBase):
     environment: str = "development"
     railway_service_name: str = ""
     enable_request_logging: bool = False
+
+    # ── passthrough ─────────────────────────────────────────────────
+    passthrough_routes_enabled: bool = False
+    passthrough_stream_capture_max_bytes: int = 10485760
+    passthrough_materialize_enabled: bool = False
+    passthrough_materialize_backfill_enabled: bool = False
+    passthrough_materialize_reconcile_interval_seconds: int = 300
+    passthrough_materialize_batch_size: int = 200
 
     # ── telemetry ───────────────────────────────────────────────────
     usage_telemetry: bool | None = None
