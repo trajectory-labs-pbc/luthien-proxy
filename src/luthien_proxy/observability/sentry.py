@@ -2,7 +2,8 @@
 
 Layer 1 (EventScrubber): strips values by key name (api_key, token, etc.)
 Layer 2 (before_send hook): summarizes LLM content variables with type+length,
-strips cookies/server_name, redacts non-safe headers.
+strips cookies/server_name, redacts non-safe headers, and drops expected
+upstream provider errors.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from itertools import islice
 from typing import Any
 
 import sentry_sdk
+from anthropic import APIStatusError
 from sentry_sdk.integrations.logging import ignore_logger
 from sentry_sdk.scrubber import DEFAULT_DENYLIST, EventScrubber
 from sentry_sdk.types import Event, Hint
@@ -43,6 +45,16 @@ _LLM_CONTENT_VARS = {
     "accumulated_events",
     "raw_http_request",
 }
+
+# Upstream statuses that mean the provider is throttling or briefly unavailable.
+# These are the backend's normal backpressure, not a proxy defect: the pipeline
+# already converts them into a BackendAPIError response for the client, and the
+# caller retries. They arrive here anyway because the Sentry Anthropic
+# integration captures at the SDK call site with handled=false, before our
+# handler ever sees them — 56 unhandled 429 events in three days, which buries
+# the failures that are ours. Client errors (4xx other than 429) still report:
+# those mean a malformed request, which is actionable.
+_EXPECTED_UPSTREAM_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
 
 _SAFE_REQUEST_KEYS = {"model", "stream", "max_tokens", "temperature", "top_p", "top_k"}
 _SAFE_HEADERS = {"content-type", "accept", "user-agent", "x-request-id"}
@@ -80,6 +92,18 @@ def _summarize(value: Any) -> Any:
     return f"<{type(value).__name__}>"
 
 
+def _is_expected_upstream_error(exc: BaseException | None) -> bool:
+    """True for provider throttling/availability errors we handle deliberately.
+
+    Matches on the SDK exception's own status_code rather than its class so a
+    provider SDK renaming or adding a status subclass cannot silently start
+    reporting again.
+    """
+    if not isinstance(exc, APIStatusError):
+        return False
+    return exc.status_code in _EXPECTED_UPSTREAM_STATUS_CODES
+
+
 def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
     """Selectively redact sensitive data while preserving debugging context.
 
@@ -91,8 +115,11 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
     drop the event entirely, or the (mutated) event to send it.
     """
     exc_info = hint.get("exc_info")
-    if isinstance(exc_info, tuple) and exc_info[0] in {KeyboardInterrupt, SystemExit}:
-        return None
+    if isinstance(exc_info, tuple):
+        if exc_info[0] in {KeyboardInterrupt, SystemExit}:
+            return None
+        if _is_expected_upstream_error(exc_info[1]):
+            return None
 
     event.pop("server_name", None)
 

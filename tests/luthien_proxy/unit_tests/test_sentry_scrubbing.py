@@ -175,6 +175,40 @@ class TestBeforeSend:
         result = _sentry_before_send(event, {"exc_info": "not-a-tuple"})
         assert result is not None
 
+    def _status_error(self, status_code: int):
+        """Build a real Anthropic status error, as the SDK raises it."""
+        import httpx
+        from anthropic import APIStatusError
+
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(status_code, request=request, json={"error": {"message": "upstream"}})
+        return APIStatusError("upstream", response=response, body=None)
+
+    def test_drops_upstream_rate_limit_error(self):
+        """A 429 from Anthropic is the upstream telling us to slow down, not a proxy
+        bug. The SDK integration captures it unhandled at the call site, which burned
+        56 events in three days and buries real failures."""
+        exc = self._status_error(429)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    def test_drops_upstream_overloaded_error(self):
+        exc = self._status_error(529)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    def test_keeps_upstream_client_error(self):
+        """A 400 means we (or our caller) built a bad request — that is actionable."""
+        exc = self._status_error(400)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
+
+    def test_keeps_proxy_bugs(self):
+        """An ordinary exception from our own code must still report."""
+        exc = TypeError("Object of type datetime is not JSON serializable")
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
+
     def test_strips_server_name(self):
         event = self._make_event()
         hint = {}
