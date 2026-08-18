@@ -116,49 +116,98 @@ class _Keepalive:
 _KEEPALIVE = _Keepalive()
 
 
-async def _anext_or_done(iterator: AsyncIterator[AnthropicPolicyEmission]) -> object:
-    """Return the next item, or the `_STREAM_DONE` sentinel when exhausted.
+class _StreamError:
+    """Sentinel carrying an exception raised while pumping `source` to completion.
 
-    Converting StopAsyncIteration into a sentinel keeps it from propagating out of
-    the wrapped Task (and avoids PEP-479 surprises inside the async generator).
+    Queued instead of raised directly so the pump task (see `_pump_to_queue`) can
+    report a failure to the consumer without itself needing to be re-awaited from
+    a context that still holds the failing span open.
+    """
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+async def _pump_to_queue(
+    source: AsyncIterator[AnthropicPolicyEmission],
+    queue: "asyncio.Queue[object]",
+) -> None:
+    """Drive `source` to completion from a single persistent task, queuing each item.
+
+    `AnthropicClient.stream()` and `_AnthropicPolicyIO._stream()` each hold an
+    OpenTelemetry span open across every chunk of the upstream response: the
+    span's `with` block attaches its context once, on the first chunk, and
+    detaches it once, when the stream is exhausted. `contextvars.Context` is
+    copied per `asyncio.Task` (see CPython's `asyncio.Task.__init__`), so a
+    context token attached while running in one Task cannot be detached while
+    running in another — `contextvars.Context.reset()` raises `ValueError`, which
+    `opentelemetry.context.detach()` catches and logs at ERROR ("Failed to detach
+    context"). A previous version of `_stream_with_keepalive` created a fresh
+    `asyncio.Task` for every upstream item (`asyncio.ensure_future` after each
+    successful `__anext__`), tripping this twice per streaming request — once for
+    each of the two nested spans above. Pumping `source` from one task, start to
+    finish, keeps every attach/detach pair inside that task's own context.
+
+    A `CancelledError` raised by `source` itself (as opposed to this task being
+    cancelled from the outside, e.g. by `_stream_with_keepalive`'s cleanup on
+    close) is relayed like any other exception: `Task.cancelling()` is 0 in that
+    case, since nothing called `.cancel()` on this task. When this task *was*
+    cancelled from the outside, `cancelling()` is nonzero and the error is
+    re-raised untouched instead of being queued — the consumer has already
+    stopped reading by then, so queuing it could block forever on a full queue.
     """
     try:
-        return await iterator.__anext__()
-    except StopAsyncIteration:
-        return _STREAM_DONE
+        async for item in source:
+            await queue.put(item)
+    except asyncio.CancelledError as exc:
+        pump_task = asyncio.current_task()
+        if pump_task is not None and pump_task.cancelling() > 0:
+            raise
+        await queue.put(_StreamError(exc))
+        return
+    except Exception as exc:
+        await queue.put(_StreamError(exc))
+        return
+    await queue.put(_STREAM_DONE)
 
 
 async def _stream_with_keepalive(
     source: AsyncIterator[AnthropicPolicyEmission],
     interval_seconds: float,
 ) -> AsyncIterator["AnthropicPolicyEmission | _Keepalive"]:
-    """Yield items from `source`, injecting a `_KEEPALIVE` sentinel whenever the
-    next item takes longer than `interval_seconds` to arrive.
+    """Yield from `source`, injecting a `_KEEPALIVE` sentinel on slow items.
 
-    The in-flight `__anext__` is shielded from the per-wait timeout, so a slow item
-    is never dropped: the timeout only triggers a keepalive and we keep waiting on
-    the same pending item. The pending task is cancelled on close.
+    A keepalive is injected whenever the next item takes longer than
+    `interval_seconds` to arrive.
+
+    `source` is pumped by a single background task for its entire lifetime (see
+    `_pump_to_queue` for why a fresh task per item is unsafe here). The one-slot
+    queue means the pump is never more than one item ahead of what this generator
+    has yielded, so a slow item is never dropped: the timeout only triggers a
+    keepalive and we keep waiting on the same queue. The pump task is cancelled
+    on close.
     """
-    iterator = source.__aiter__()
-    pending: asyncio.Task[object] | None = None
+    queue: "asyncio.Queue[object]" = asyncio.Queue(maxsize=1)
+    pump = asyncio.ensure_future(_pump_to_queue(source, queue))
     try:
         while True:
-            if pending is None:
-                pending = asyncio.ensure_future(_anext_or_done(iterator))
             try:
-                item = await asyncio.wait_for(asyncio.shield(pending), interval_seconds)
+                item = await asyncio.wait_for(queue.get(), interval_seconds)
             except asyncio.TimeoutError:
                 yield _KEEPALIVE
                 continue
-            pending = None
             if item is _STREAM_DONE:
                 return
+            if isinstance(item, _StreamError):
+                raise item.exc
             yield cast("AnthropicPolicyEmission", item)
     finally:
-        if pending is not None and not pending.done():
-            pending.cancel()
+        if not pump.done():
+            pump.cancel()
             try:
-                await pending
+                await pump
             except BaseException:
                 pass
 
