@@ -20,8 +20,31 @@ def _log_task_exception(task: asyncio.Task[None]) -> None:
         logger.exception("Passthrough reconciliation worker raised unexpectedly", exc_info=error)
 
 
+def _sweep_selected_nothing(stats: ReconcileStats) -> bool:
+    """Return whether a sweep's eligibility query matched zero transactions.
+
+    Distinct from "did nothing succeed": a sweep that only hit failures
+    (materialized=0) but still selected rows must keep running so it can
+    dead-letter permanent ones and retry transient ones. Only an eligibility
+    query that returned no rows at all means the backlog is actually drained.
+    """
+    return (
+        stats.materialized == 0
+        and stats.already_materialized == 0
+        and stats.skipped_ineligible == 0
+        and stats.failed == 0
+    )
+
+
 class PassthroughReconcileWorker:
-    """Run bounded passthrough reconciliation sweeps until shutdown."""
+    """Run bounded passthrough reconciliation sweeps until the backlog drains or shutdown.
+
+    PASSTHROUGH_MATERIALIZE_BACKFILL_ENABLED is documented as a one-shot backfill
+    for historical request_logs, not a perpetual poller. Once a sweep selects zero
+    eligible transactions -- meaning nothing is left to materialize, retry, or
+    dead-letter -- the loop exits instead of continuing to sweep an empty backlog
+    every interval_seconds forever.
+    """
 
     def __init__(self, *, db_pool: DatabasePool, limit: int, interval_seconds: int) -> None:
         """Initialize the database-backed worker and its cadence."""
@@ -38,6 +61,9 @@ class PassthroughReconcileWorker:
                 logger.exception("Passthrough reconciliation sweep failed; retrying next interval")
             else:
                 self._log_stats(stats)
+                if _sweep_selected_nothing(stats):
+                    logger.info("Passthrough reconciliation backlog drained; one-shot backfill worker stopping.")
+                    return
             await asyncio.sleep(self._interval_seconds)
 
     def _log_stats(self, stats: ReconcileStats) -> None:

@@ -15,6 +15,7 @@ from luthien_proxy.passthrough_materialize.materialize import materialize_transa
 from luthien_proxy.passthrough_materialize.materialize_types import (
     AlreadyMaterialized,
     CanonicalTransaction,
+    MaterializationFailed,
     MaterializationResult,
     Materialized,
     ReconcileStats,
@@ -97,7 +98,15 @@ async def _event_count(pool: DatabasePool, transaction_id: str) -> int:
     return count
 
 
-async def test_reconcile_materializes_only_eligible_unmaterialized_transactions_when_raw_logs_are_mixed(
+async def _dead_letter_reason(pool: DatabasePool, transaction_id: str) -> str | None:
+    async with pool.connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT reason FROM passthrough_materialization_dead_letters WHERE transaction_id = $1", transaction_id
+        )
+    return None if row is None else str(row["reason"])
+
+
+async def test_reconcile_materializes_only_eligible_unmaterialized_transactions_and_converges_next_sweep(
     reconcile_pool: DatabasePool,
 ) -> None:
     # Given
@@ -117,11 +126,90 @@ async def test_reconcile_materializes_only_eligible_unmaterialized_transactions_
 
     # Then
     assert first_pass == ReconcileStats(materialized=1, failed=1)
-    assert second_pass == ReconcileStats(failed=1)
+    # The permanent failure ("failure") was dead-lettered on the first pass, so
+    # the second pass -- run over the exact same rows -- selects nothing new.
+    # Before the fix this asserted ReconcileStats(failed=1): the same broken
+    # transaction was re-selected and re-failed forever.
+    assert second_pass == ReconcileStats()
     assert await _event_count(reconcile_pool, ready.transaction_id) == 2
     assert await _event_count(reconcile_pool, already.transaction_id) == 2
     assert await _event_count(reconcile_pool, ineligible.transaction_id) == 0
     assert await _event_count(reconcile_pool, failure.transaction_id) == 0
+    assert await _dead_letter_reason(reconcile_pool, failure.transaction_id) == "missing_required_field"
+    assert await _dead_letter_reason(reconcile_pool, ready.transaction_id) is None
+
+
+async def test_reconcile_converges_when_the_entire_backlog_is_permanently_broken(
+    reconcile_pool: DatabasePool,
+) -> None:
+    """Reproduces the production bug: every eligible row fails identically forever.
+
+    Before persisting dead letters, a sweep over an all-permanently-broken backlog
+    re-selected and re-failed the exact same rows on every subsequent sweep -- the
+    root cause of PassthroughReconcileWorker running forever with zero progress.
+    """
+    # Given
+    broken_seeds = [
+        replace(_valid_openai_seed(f"broken-{i}", _at(9)), request_body={"model": "gpt-4.1"}) for i in range(5)
+    ]
+    for seed in broken_seeds:
+        await _seed_raw_log(reconcile_pool, seed)
+
+    # When
+    first_pass = await reconcile_passthrough(reconcile_pool, limit=10)
+    second_pass = await reconcile_passthrough(reconcile_pool, limit=10)
+
+    # Then
+    assert first_pass == ReconcileStats(failed=5)
+    assert second_pass == ReconcileStats()
+    async with reconcile_pool.connection() as conn:
+        dead_letter_count = await conn.fetchval("SELECT COUNT(*) FROM passthrough_materialization_dead_letters")
+    assert dead_letter_count == 5
+
+
+async def test_reconcile_leaves_a_transient_failure_reason_eligible_for_retry(
+    reconcile_pool: DatabasePool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given
+    transient = _valid_openai_seed("transient", _at(9))
+    await _seed_raw_log(reconcile_pool, transient)
+    original_materialize = reconcile_module.materialize_transaction
+
+    async def materialize_with_transient_failure(pool: DatabasePool, transaction_id: str) -> MaterializationResult:
+        if transaction_id == transient.transaction_id:
+            return MaterializationFailed(transaction_id=transaction_id, reason="missing_request_logs")
+        return await original_materialize(pool, transaction_id)
+
+    monkeypatch.setattr(reconcile_module, "materialize_transaction", materialize_with_transient_failure)
+
+    # When
+    first_pass = await reconcile_passthrough(reconcile_pool, limit=10)
+    second_pass = await reconcile_passthrough(reconcile_pool, limit=10)
+
+    # Then: unlike a permanent failure, a "missing_request_logs" failure is never
+    # dead-lettered, so it is re-selected (and re-fails) on every sweep.
+    assert first_pass == ReconcileStats(failed=1)
+    assert second_pass == ReconcileStats(failed=1)
+    assert await _dead_letter_reason(reconcile_pool, transient.transaction_id) is None
+
+
+async def test_migration_creates_the_dead_letter_table_and_supporting_index(reconcile_pool: DatabasePool) -> None:
+    """Both the Postgres and SQLite 023 migrations must produce this schema.
+
+    This exercises the SQLite side (used by every fixture in this file via
+    check_migrations); the Postgres side was verified against a locally seeded
+    multi-million-row table (see PR description for EXPLAIN evidence).
+    """
+    async with reconcile_pool.connection() as conn:
+        table = await conn.fetchrow(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'passthrough_materialization_dead_letters'"
+        )
+        index = await conn.fetchrow(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_request_logs_passthrough_eligible'"
+        )
+    assert table is not None
+    assert index is not None
 
 
 async def test_reconcile_respects_oldest_first_limit_and_since_when_selecting_transactions(

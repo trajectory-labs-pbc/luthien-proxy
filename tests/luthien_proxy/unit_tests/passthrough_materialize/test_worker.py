@@ -110,3 +110,65 @@ async def test_reconcile_worker_stop_cancels_an_inflight_sweep(
     # Then
     assert task.cancelled()
     assert worker._task is None
+
+
+async def test_reconcile_worker_stops_once_a_sweep_selects_nothing(
+    worker_pool: DatabasePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given
+    sweep_count = 0
+
+    async def reconcile(pool: DatabasePool, *, limit: int) -> ReconcileStats:
+        nonlocal sweep_count
+        sweep_count += 1
+        return ReconcileStats()
+
+    monkeypatch.setattr(worker_module, "reconcile_passthrough", reconcile)
+    worker = PassthroughReconcileWorker(db_pool=worker_pool, limit=23, interval_seconds=60)
+
+    # When
+    worker.start()
+    task = worker._task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=1)
+
+    # Then: the one-shot backfill worker stops itself on an empty sweep instead
+    # of sleeping interval_seconds and sweeping an empty backlog forever.
+    assert sweep_count == 1
+    assert task.done()
+    assert not task.cancelled()
+
+
+async def test_reconcile_worker_keeps_sweeping_while_failures_remain(
+    worker_pool: DatabasePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given
+    original_sleep = asyncio.sleep
+    second_sweep_started = asyncio.Event()
+    sweep_count = 0
+
+    async def reconcile(pool: DatabasePool, *, limit: int) -> ReconcileStats:
+        nonlocal sweep_count
+        sweep_count += 1
+        if sweep_count == 2:
+            second_sweep_started.set()
+        return ReconcileStats(failed=1)
+
+    async def advance_without_delay(_seconds: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(worker_module, "reconcile_passthrough", reconcile)
+    monkeypatch.setattr(worker_module.asyncio, "sleep", advance_without_delay)
+    worker = PassthroughReconcileWorker(db_pool=worker_pool, limit=23, interval_seconds=60)
+
+    # When
+    worker.start()
+    try:
+        await asyncio.wait_for(second_sweep_started.wait(), timeout=1)
+    finally:
+        await worker.stop()
+
+    # Then: a sweep that keeps failing something (not a fully empty sweep) must
+    # keep running -- it still has permanent failures to dead-letter and
+    # transient ones to retry.
+    assert sweep_count >= 2
