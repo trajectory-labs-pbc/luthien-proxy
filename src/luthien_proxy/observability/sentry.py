@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from itertools import islice
-from typing import Any
+from typing import Any, Mapping
 
 import sentry_sdk
 from anthropic import APIStatusError
@@ -53,18 +53,46 @@ _LLM_CONTENT_VARS = {
 # handle every AnthropicStatusError the same way regardless of status code)
 # and, for the throttling/availability codes, the caller retries. They arrive
 # here anyway because the Sentry Anthropic integration captures at the SDK
-# call site with handled=false, before our handler ever sees them:
-#   - 408/429/500/502/503/504/529: provider throttling or brief
-#     unavailability (56 unhandled 429 events in three days before this
-#     filter existed).
-#   - 400/404/401: the client sent something the provider legitimately
-#     rejected — malformed message content, an unknown model name, or an
-#     invalid bearer token passed through client-credential mode. The proxy
-#     is a transparent passthrough here: it relays the provider's rejection
-#     unchanged and did not cause it (LUTHIEN-6: 1,080 events for one
-#     recurring 400; LUTHIEN-2: unknown-model 404s; LUTHIEN-D: invalid-token
-#     401s).
-_EXPECTED_UPSTREAM_STATUS_CODES = frozenset({400, 401, 404, 408, 429, 500, 502, 503, 504, 529})
+# call site with handled=false, before our handler ever sees them.
+
+# 408/429/500/502/503/504/529: provider throttling or brief unavailability.
+# Structurally impossible for the proxy to have provoked — dropped
+# unconditionally (56 unhandled 429 events in three days before this filter
+# existed).
+_PROVIDER_SIDE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
+
+# 400/404/401: *usually* the client sent something the provider legitimately
+# rejected — malformed message content, an unknown model name, or an invalid
+# bearer token passed through client-credential mode (LUTHIEN-6: 1,080 events
+# for one recurring 400; LUTHIEN-2: unknown-model 404s; LUTHIEN-D:
+# invalid-token 401s). But the proxy is not always a transparent passthrough:
+# policy hooks can mutate or replace the request before it reaches Anthropic,
+# and operator-configured UPSTREAM_HEADERS or policy-context injection can
+# alter it too — any of those could turn a proxy bug into what looks like a
+# provider rejection. Only drop these when the request carries provenance
+# (the PASSTHROUGH_TAG scope tag, set at the actual upstream call boundary in
+# _AnthropicPolicyIO) proving nothing touched it after the client sent it.
+_CLIENT_OR_PASSTHROUGH_STATUS_CODES = frozenset({400, 401, 404})
+
+_EXPECTED_UPSTREAM_STATUS_CODES = _PROVIDER_SIDE_STATUS_CODES | _CLIENT_OR_PASSTHROUGH_STATUS_CODES
+
+# Scope tag set by the Anthropic pipeline (see _AnthropicPolicyIO in
+# anthropic_processor.py) immediately before the upstream call, when the
+# request body and headers going to Anthropic are exactly what the client
+# sent — no policy hook, header injection, or context injection touched them.
+PASSTHROUGH_TAG = "luthien.request_unmodified_passthrough"
+
+
+def tag_request_provenance(unmodified: bool) -> None:
+    """Record on the current Sentry scope whether the outgoing request is untouched.
+
+    Called at the upstream call boundary so `_sentry_before_send` can tell a
+    genuine client/provider 400/401/404 from one the proxy or a policy
+    caused. Safe to call even when Sentry is disabled or uninitialized —
+    `sentry_sdk.set_tag` is a no-op against the default scope in that case.
+    """
+    sentry_sdk.set_tag(PASSTHROUGH_TAG, unmodified)
+
 
 _SAFE_REQUEST_KEYS = {"model", "stream", "max_tokens", "temperature", "top_p", "top_k"}
 _SAFE_HEADERS = {"content-type", "accept", "user-agent", "x-request-id"}
@@ -102,16 +130,23 @@ def _summarize(value: Any) -> Any:
     return f"<{type(value).__name__}>"
 
 
-def _is_expected_upstream_error(exc: BaseException | None) -> bool:
+def _is_expected_upstream_error(exc: BaseException | None, tags: Mapping[str, object]) -> bool:
     """True for provider errors that are the client's or provider's fault, not ours.
 
     Matches on the SDK exception's own status_code rather than its class so a
     provider SDK renaming or adding a status subclass cannot silently start
-    reporting again.
+    reporting again. 400/401/404 additionally require the PASSTHROUGH_TAG
+    scope tag proving the proxy relayed the request unchanged — see
+    _CLIENT_OR_PASSTHROUGH_STATUS_CODES above.
     """
     if not isinstance(exc, APIStatusError):
         return False
-    return exc.status_code in _EXPECTED_UPSTREAM_STATUS_CODES
+    status = exc.status_code
+    if status in _PROVIDER_SIDE_STATUS_CODES:
+        return True
+    if status in _CLIENT_OR_PASSTHROUGH_STATUS_CODES:
+        return tags.get(PASSTHROUGH_TAG) is True
+    return False
 
 
 def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
@@ -128,7 +163,7 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
     if isinstance(exc_info, tuple):
         if exc_info[0] in {KeyboardInterrupt, SystemExit}:
             return None
-        if _is_expected_upstream_error(exc_info[1]):
+        if _is_expected_upstream_error(exc_info[1], event.get("tags") or {}):
             return None
 
     event.pop("server_name", None)

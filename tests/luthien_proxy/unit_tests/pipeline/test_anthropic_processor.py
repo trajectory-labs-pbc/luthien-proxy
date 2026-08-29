@@ -2084,6 +2084,7 @@ class TestAnthropicPolicyIOBuffering:
             user_id=None,
             request_log_recorder=MagicMock(),
             is_streaming=is_streaming,
+            client_request_unmodified=True,
         )
 
     def test_buffer_raw_events_false_when_streaming(self):
@@ -2120,6 +2121,128 @@ class TestAnthropicPolicyIOBuffering:
 
         raw_events = accumulated_events if not io._buffer_raw_events else io._raw_backend_events
         assert raw_events is io._raw_backend_events
+
+
+class TestAnthropicPolicyIORequestProvenance:
+    """Tests for _AnthropicPolicyIO tagging Sentry with request passthrough provenance.
+
+    Covers PR #809 finding: 400/401/404 from Anthropic must only be treated as
+    "expected" (dropped from Sentry) when the request that reached Anthropic is
+    provably what the client sent — see observability/sentry.py:PASSTHROUGH_TAG.
+    """
+
+    def _make_io(self, *, request: AnthropicRequest, client_request_unmodified: bool = True) -> _AnthropicPolicyIO:
+        return _AnthropicPolicyIO(
+            initial_request=request,
+            anthropic_client=MagicMock(),
+            emitter=MagicMock(),
+            call_id="test-call",
+            session_id=None,
+            user_id=None,
+            request_log_recorder=MagicMock(),
+            is_streaming=False,
+            client_request_unmodified=client_request_unmodified,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmodified_request_tags_passthrough_true(self):
+        """A request nothing touched must tag True."""
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(request)
+
+        mock_tag.assert_called_once_with(True)
+
+    @pytest.mark.asyncio
+    async def test_policy_replaced_request_tags_passthrough_false(self):
+        """A policy hook returning a different request object must tag False."""
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        replaced_request: AnthropicRequest = {**request, "max_tokens": 999}
+        io.set_request(replaced_request)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(replaced_request)
+
+        mock_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_policy_mutated_request_in_place_tags_passthrough_false(self):
+        """A policy hook mutating the SAME dict in place (rather than replacing
+        it) must still be detected — _initial_request is a deep copy exactly to
+        guard against this aliasing corrupting the comparison (matches
+        _AddMaxTokensPolicy's mutate-and-return style in TestRunPolicyHooks).
+        """
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        request["max_tokens"] = 999
+        io.set_request(request)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(request)
+
+        mock_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_pipeline_level_modification_tags_passthrough_false_even_if_hooks_are_noop(self):
+        """client_request_unmodified=False (context injection / UPSTREAM_HEADERS
+        happened before hooks ran) must tag False even when no policy hook
+        changes anything further.
+        """
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        io = self._make_io(request=request, client_request_unmodified=False)
+        io._anthropic_client.complete = AsyncMock(return_value={"id": "msg_1"})
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            await io.complete(request)
+
+        mock_tag.assert_called_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_stream_tags_passthrough_based_on_same_rules(self):
+        """stream() must apply the identical provenance rule as complete()."""
+        request: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+        io = self._make_io(request=request)
+
+        async def _fake_stream(req, extra_headers=None):
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        io._anthropic_client.stream = _fake_stream
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance") as mock_tag:
+            async for _ in io.stream(request):
+                pass
+
+        mock_tag.assert_called_once_with(True)
 
 
 class TestStreamingWebhookGate:

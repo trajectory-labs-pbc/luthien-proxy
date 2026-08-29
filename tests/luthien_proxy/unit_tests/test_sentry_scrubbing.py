@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from luthien_proxy.observability.sentry import _sentry_before_send, _summarize
+from luthien_proxy.observability.sentry import PASSTHROUGH_TAG, _sentry_before_send, _summarize
 
 pytestmark = pytest.mark.timeout(10)
 
@@ -88,9 +88,12 @@ class TestBeforeSend:
         include_cookies=True,
         include_frame_vars=True,
         frame_vars_empty=False,
+        tags=None,
     ):
         """Build a realistic Sentry event for testing."""
         event = {}
+        if tags is not None:
+            event["tags"] = tags
 
         if include_server_name:
             event["server_name"] = "gateway-prod-123"
@@ -199,24 +202,55 @@ class TestBeforeSend:
 
     def test_drops_upstream_bad_request_error(self):
         """A 400 means the client sent content Anthropic rejects (e.g. an unsupported
-        field). The proxy relays it unchanged — see LUTHIEN-6, 1,080 events for one
-        recurring case — it did not build the request itself."""
+        field). Dropped only when the request carrying the PASSTHROUGH_TAG proves the
+        proxy relayed it unchanged — see LUTHIEN-6, 1,080 events for one recurring case."""
         exc = self._status_error(400)
-        event = self._make_event()
+        event = self._make_event(tags={PASSTHROUGH_TAG: True})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
 
     def test_drops_upstream_not_found_error(self):
-        """A 404 means the client asked for a model Anthropic doesn't have (LUTHIEN-2)."""
+        """A 404 means the client asked for a model Anthropic doesn't have (LUTHIEN-2),
+        and the PASSTHROUGH_TAG proves the proxy didn't rewrite the request."""
         exc = self._status_error(404)
-        event = self._make_event()
+        event = self._make_event(tags={PASSTHROUGH_TAG: True})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
 
     def test_drops_upstream_authentication_error(self):
         """A 401 means the credential passed through to Anthropic was invalid
-        (LUTHIEN-D) — the proxy correctly forwarded a bad token, it didn't mint one."""
+        (LUTHIEN-D) — the proxy correctly forwarded a bad token, it didn't mint one,
+        proven by the PASSTHROUGH_TAG."""
         exc = self._status_error(401)
-        event = self._make_event()
+        event = self._make_event(tags={PASSTHROUGH_TAG: True})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    def test_keeps_proxy_modified_bad_request_error(self):
+        """A 400 where the request was NOT proven to be an unmodified client
+        passthrough (PASSTHROUGH_TAG missing or False) must still report — a
+        policy hook or header/context injection could have built the invalid
+        request that Anthropic rejected, and that's a proxy bug (thermonuclear
+        review finding: consensus High on PR #809)."""
+        exc = self._status_error(400)
+        event = self._make_event(tags={PASSTHROUGH_TAG: False})
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
+
+    def test_keeps_proxy_modified_not_found_error(self):
+        """Same as the 400 case: a 404 without proven passthrough stays visible."""
+        exc = self._status_error(404)
+        event = self._make_event(tags={PASSTHROUGH_TAG: False})
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
+
+    def test_keeps_proxy_modified_authentication_error(self):
+        """Same as the 400 case: a 401 without proven passthrough stays visible."""
+        exc = self._status_error(401)
+        event = self._make_event(tags={PASSTHROUGH_TAG: False})
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
+
+    def test_keeps_bad_request_error_when_passthrough_tag_absent(self):
+        """No PASSTHROUGH_TAG at all (e.g. the tag was never set) must fail
+        closed — absence of proof is not proof of passthrough."""
+        exc = self._status_error(400)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
 
     def test_keeps_upstream_status_code_outside_expected_set(self):
         """A status code we have not classified as expected (e.g. 403) still reports,
