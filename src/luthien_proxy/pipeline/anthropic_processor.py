@@ -28,7 +28,6 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Literal, TypedDict, TypeGuard, cast
 
-import httpx
 from anthropic import APIConnectionError as AnthropicConnectionError
 from anthropic import APIStatusError as AnthropicStatusError
 from anthropic.lib.streaming import MessageStreamEvent
@@ -43,7 +42,7 @@ from luthien_proxy.credential_manager import CredentialManager
 from luthien_proxy.credentials import Credential, CredentialError
 from luthien_proxy.exceptions import BackendAPIError
 from luthien_proxy.inference.registry import InferenceProviderRegistry
-from luthien_proxy.llm.anthropic_client import AnthropicClient
+from luthien_proxy.llm.anthropic_client import AnthropicClient, AnthropicUpstreamTransportError
 from luthien_proxy.llm.types.anthropic import (
     AnthropicContentBlock,
     AnthropicRequest,
@@ -1206,11 +1205,14 @@ def _build_error_event(e: Exception, call_id: str) -> _StreamErrorEvent:
         error_type = "api_connection_error"
         message = client_error_detail(str(e), "An error occurred while connecting to the API.")
         logger.warning(f"[{call_id}] Mid-stream Anthropic connection error: {repr(e)}")
-    elif isinstance(e, httpx.TransportError):
-        # Raised directly by httpx (not wrapped in AnthropicConnectionError) when the
-        # upstream connection drops while we're mid-read of a streaming response body
-        # (e.g. RemoteProtocolError, ReadTimeout, ReadError) — the backend's network,
-        # not a proxy defect (LUTHIEN-A/B/G).
+    elif isinstance(e, AnthropicUpstreamTransportError):
+        # Raised by AnthropicClient.complete/stream when the actual upstream
+        # connection drops (e.g. RemoteProtocolError, ReadTimeout, ReadError
+        # while mid-read of a streaming response body) — the backend's
+        # network, not a proxy defect (LUTHIEN-A/B/G). A raw
+        # httpx.TransportError raised anywhere else (e.g. a policy's own
+        # outbound call) is NOT this type and falls to the generic branch
+        # below, where it stays error-level and visible.
         error_type = "api_connection_error"
         message = client_error_detail(str(e), "An error occurred while connecting to the API.")
         logger.warning(f"[{call_id}] Mid-stream transport error: {repr(e)}")
@@ -1282,6 +1284,18 @@ def _handle_anthropic_error(e: Exception, call_id: str) -> None:
         ) from e
     elif isinstance(e, AnthropicConnectionError):
         logger.warning(f"[{call_id}] Anthropic connection error: {repr(e)}")
+        raise BackendAPIError(
+            status_code=502,
+            message=client_error_detail(str(e), "An error occurred while connecting to the API."),
+            error_type="api_connection_error",
+            client_format=ClientFormat.ANTHROPIC,
+            provider="anthropic",
+        ) from e
+    elif isinstance(e, AnthropicUpstreamTransportError):
+        # Same upstream-network carve-out as _build_error_event's mid-stream
+        # branch, for the non-streaming path — previously this fell through
+        # to "let them propagate" and surfaced as an unclassified 500.
+        logger.warning(f"[{call_id}] Anthropic upstream transport error: {repr(e)}")
         raise BackendAPIError(
             status_code=502,
             message=client_error_detail(str(e), "An error occurred while connecting to the API."),

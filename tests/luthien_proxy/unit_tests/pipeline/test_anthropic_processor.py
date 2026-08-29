@@ -29,6 +29,7 @@ from tests.constants import DEFAULT_TEST_MODEL
 from tests.luthien_proxy.fixtures.policy_context import make_policy_context
 
 from luthien_proxy.exceptions import BackendAPIError
+from luthien_proxy.llm.anthropic_client import AnthropicUpstreamTransportError
 from luthien_proxy.llm.types.anthropic import AnthropicRequest, AnthropicResponse, build_usage
 from luthien_proxy.pipeline.anthropic_processor import (
     _AnthropicPolicyIO,
@@ -854,13 +855,11 @@ class TestBuildErrorEvent:
         assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
 
     def test_builds_transport_error_event_and_logs_at_warning(self, caplog):
-        """httpx errors raised directly (not wrapped by the Anthropic SDK) when the
-        upstream connection drops mid-stream are the backend's network, not a proxy
-        defect (LUTHIEN-A/B/G) — must log at warning, not error."""
-        mock_request = HttpxRequest("POST", "https://api.anthropic.com/v1/messages")
-        error = httpx.RemoteProtocolError(
-            "peer closed connection without sending complete message body (incomplete chunked read)",
-            request=mock_request,
+        """AnthropicUpstreamTransportError — raised by AnthropicClient when the
+        actual upstream connection drops mid-stream — is the backend's network,
+        not a proxy defect (LUTHIEN-A/B/G) — must log at warning, not error."""
+        error = AnthropicUpstreamTransportError(
+            "peer closed connection without sending complete message body (incomplete chunked read)"
         )
 
         with caplog.at_level(logging.WARNING, logger="luthien_proxy.pipeline.anthropic_processor"):
@@ -872,6 +871,23 @@ class TestBuildErrorEvent:
         transport_records = [r for r in caplog.records if "Mid-stream transport error" in r.message]
         assert transport_records, f"expected a log record; got {[r.message for r in caplog.records]}"
         assert all(r.levelno == logging.WARNING for r in transport_records)
+
+    def test_builds_generic_error_event_for_policy_origin_transport_error(self, caplog):
+        """A raw httpx.TransportError NOT raised by AnthropicClient (e.g. from a
+        policy's own outbound HTTP call) is not AnthropicUpstreamTransportError,
+        so it must stay on the generic error-level path — the upstream-network
+        carve-out must not swallow a policy/gateway bug (thermonuclear-deep-review
+        finding on PR #814)."""
+        mock_request = HttpxRequest("POST", "https://example.com/judge")
+        error = httpx.RemoteProtocolError("peer closed connection", request=mock_request)
+
+        with caplog.at_level(logging.ERROR, logger="luthien_proxy.pipeline.anthropic_processor"):
+            event = _build_error_event(error, "test-call-id")
+
+        assert event.get("error", {}).get("type") == "api_error"
+        error_records = [r for r in caplog.records if "Mid-stream error" in r.message]
+        assert error_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in error_records)
 
     def test_builds_generic_error_event(self):
         """Generic exceptions produce a sanitized error event — internal details are not forwarded."""
@@ -1138,6 +1154,20 @@ class TestHandleAnthropicError:
     def test_connection_error_raises_backend_api_error(self):
         """Connection errors should raise BackendAPIError with 502."""
         exc = AnthropicConnectionError(request=HttpxRequest("POST", "https://api.anthropic.com/v1/messages"))
+
+        with pytest.raises(BackendAPIError) as exc_info:
+            _handle_anthropic_error(exc, "test-call")
+
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_type == "api_connection_error"
+
+    def test_upstream_transport_error_raises_backend_api_error(self):
+        """AnthropicUpstreamTransportError (raised by AnthropicClient when the
+        actual upstream connection drops) should raise BackendAPIError with 502
+        — previously this exception type wasn't classified at all in the
+        non-streaming path and propagated as an unclassified 500
+        (thermonuclear-deep-review finding on PR #814)."""
+        exc = AnthropicUpstreamTransportError("peer closed connection")
 
         with pytest.raises(BackendAPIError) as exc_info:
             _handle_anthropic_error(exc, "test-call")
