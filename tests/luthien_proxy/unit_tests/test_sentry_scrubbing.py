@@ -197,9 +197,31 @@ class TestBeforeSend:
         event = self._make_event()
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
 
-    def test_keeps_upstream_client_error(self):
-        """A 400 means we (or our caller) built a bad request — that is actionable."""
+    def test_drops_upstream_bad_request_error(self):
+        """A 400 means the client sent content Anthropic rejects (e.g. an unsupported
+        field). The proxy relays it unchanged — see LUTHIEN-6, 1,080 events for one
+        recurring case — it did not build the request itself."""
         exc = self._status_error(400)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    def test_drops_upstream_not_found_error(self):
+        """A 404 means the client asked for a model Anthropic doesn't have (LUTHIEN-2)."""
+        exc = self._status_error(404)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    def test_drops_upstream_authentication_error(self):
+        """A 401 means the credential passed through to Anthropic was invalid
+        (LUTHIEN-D) — the proxy correctly forwarded a bad token, it didn't mint one."""
+        exc = self._status_error(401)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    def test_keeps_upstream_status_code_outside_expected_set(self):
+        """A status code we have not classified as expected (e.g. 403) still reports,
+        so a new upstream failure mode is visible until someone evaluates it."""
+        exc = self._status_error(403)
         event = self._make_event()
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
 

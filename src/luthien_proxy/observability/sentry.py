@@ -46,15 +46,25 @@ _LLM_CONTENT_VARS = {
     "raw_http_request",
 }
 
-# Upstream statuses that mean the provider is throttling or briefly unavailable.
-# These are the backend's normal backpressure, not a proxy defect: the pipeline
-# already converts them into a BackendAPIError response for the client, and the
-# caller retries. They arrive here anyway because the Sentry Anthropic
-# integration captures at the SDK call site with handled=false, before our
-# handler ever sees them — 56 unhandled 429 events in three days, which buries
-# the failures that are ours. Client errors (4xx other than 429) still report:
-# those mean a malformed request, which is actionable.
-_EXPECTED_UPSTREAM_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
+# Upstream statuses that mean the request/response is the client's or the
+# provider's problem, not a proxy defect. The pipeline already converts every
+# one of these into a BackendAPIError response for the client (see
+# _handle_anthropic_error / _build_error_event, which log at warning and
+# handle every AnthropicStatusError the same way regardless of status code)
+# and, for the throttling/availability codes, the caller retries. They arrive
+# here anyway because the Sentry Anthropic integration captures at the SDK
+# call site with handled=false, before our handler ever sees them:
+#   - 408/429/500/502/503/504/529: provider throttling or brief
+#     unavailability (56 unhandled 429 events in three days before this
+#     filter existed).
+#   - 400/404/401: the client sent something the provider legitimately
+#     rejected — malformed message content, an unknown model name, or an
+#     invalid bearer token passed through client-credential mode. The proxy
+#     is a transparent passthrough here: it relays the provider's rejection
+#     unchanged and did not cause it (LUTHIEN-6: 1,080 events for one
+#     recurring 400; LUTHIEN-2: unknown-model 404s; LUTHIEN-D: invalid-token
+#     401s).
+_EXPECTED_UPSTREAM_STATUS_CODES = frozenset({400, 401, 404, 408, 429, 500, 502, 503, 504, 529})
 
 _SAFE_REQUEST_KEYS = {"model", "stream", "max_tokens", "temperature", "top_p", "top_k"}
 _SAFE_HEADERS = {"content-type", "accept", "user-agent", "x-request-id"}
@@ -93,7 +103,7 @@ def _summarize(value: Any) -> Any:
 
 
 def _is_expected_upstream_error(exc: BaseException | None) -> bool:
-    """True for provider throttling/availability errors we handle deliberately.
+    """True for provider errors that are the client's or provider's fault, not ours.
 
     Matches on the SDK exception's own status_code rather than its class so a
     provider SDK renaming or adding a status subclass cannot silently start
