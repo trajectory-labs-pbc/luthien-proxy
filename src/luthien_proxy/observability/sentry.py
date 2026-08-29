@@ -69,6 +69,15 @@ _EXTRA_DENYLIST: list[str] = [
 # outer ExceptionGroup, not the ClientDisconnect itself.
 _DROPPED_EXCEPTION_TYPES = frozenset({("starlette.requests", "ClientDisconnect")})
 
+# The (module, type) an ExceptionGroup/BaseExceptionGroup wrapper entry
+# carries in the flattened list — never a real failure by itself, just the
+# container for its members. Excluded when deciding whether "every exception
+# in this event is a dropped one": a mixed group like
+# ExceptionGroup(ClientDisconnect, RuntimeError) must still report, since
+# RuntimeError is a genuine proxy-side failure riding alongside the
+# disconnect, not something the carve-out should hide.
+_EXCEPTION_GROUP_TYPES = frozenset({"ExceptionGroup", "BaseExceptionGroup"})
+
 
 def _summarize(value: Any) -> Any:
     """Replace a value with its type and size, preserving debuggability."""
@@ -106,8 +115,9 @@ def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
         return None
 
     exception_values = event.get("exception", {}).get("values", [])
-    if any(
-        (exc_entry.get("module"), exc_entry.get("type")) in _DROPPED_EXCEPTION_TYPES for exc_entry in exception_values
+    leaf_exceptions = [e for e in exception_values if e.get("type") not in _EXCEPTION_GROUP_TYPES]
+    if leaf_exceptions and all(
+        (exc_entry.get("module"), exc_entry.get("type")) in _DROPPED_EXCEPTION_TYPES for exc_entry in leaf_exceptions
     ):
         return None
 
