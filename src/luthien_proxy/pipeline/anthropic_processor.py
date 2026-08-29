@@ -28,6 +28,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Literal, TypedDict, TypeGuard, cast
 
+import httpx
 from anthropic import APIConnectionError as AnthropicConnectionError
 from anthropic import APIStatusError as AnthropicStatusError
 from anthropic.lib.streaming import MessageStreamEvent
@@ -510,7 +511,9 @@ async def _process_request(
         try:
             body = await request.json()
         except json.JSONDecodeError as e:
-            logger.error(f"[{call_id}] Malformed JSON in Anthropic request: {repr(e)}")
+            # Client sent invalid JSON — not a proxy defect (LUTHIEN-7/9); the
+            # 400 below is the actionable response to the client.
+            logger.warning(f"[{call_id}] Malformed JSON in Anthropic request: {repr(e)}")
             raise HTTPException(status_code=400, detail="Invalid JSON in request body")
         headers = {k.lower(): v for k, v in request.headers.items()}
 
@@ -1203,6 +1206,14 @@ def _build_error_event(e: Exception, call_id: str) -> _StreamErrorEvent:
         error_type = "api_connection_error"
         message = client_error_detail(str(e), "An error occurred while connecting to the API.")
         logger.warning(f"[{call_id}] Mid-stream Anthropic connection error: {repr(e)}")
+    elif isinstance(e, httpx.TransportError):
+        # Raised directly by httpx (not wrapped in AnthropicConnectionError) when the
+        # upstream connection drops while we're mid-read of a streaming response body
+        # (e.g. RemoteProtocolError, ReadTimeout, ReadError) — the backend's network,
+        # not a proxy defect (LUTHIEN-A/B/G).
+        error_type = "api_connection_error"
+        message = client_error_detail(str(e), "An error occurred while connecting to the API.")
+        logger.warning(f"[{call_id}] Mid-stream transport error: {repr(e)}")
     else:
         error_type = "api_error"
         message = client_error_detail(str(e), "An internal error occurred while processing the request.")

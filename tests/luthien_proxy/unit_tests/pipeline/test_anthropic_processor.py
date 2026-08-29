@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from anthropic import APIConnectionError as AnthropicConnectionError
 from anthropic import APIStatusError as AnthropicStatusError
@@ -315,11 +317,14 @@ class TestProcessRequest:
         assert "payload too large" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_malformed_json_returns_400(self, mock_request, mock_emitter, mock_span):
+    async def test_malformed_json_returns_400(self, mock_request, mock_emitter, mock_span, caplog):
         """Test that malformed JSON in request body returns 400 error."""
         mock_request.json = AsyncMock(side_effect=json.JSONDecodeError("Expecting value", "", 0))
 
-        with patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer:
+        with (
+            patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer,
+            caplog.at_level(logging.WARNING, logger="luthien_proxy.pipeline.anthropic_processor"),
+        ):
             mock_tracer.start_as_current_span.return_value.__enter__ = MagicMock(return_value=mock_span)
             mock_tracer.start_as_current_span.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -332,6 +337,11 @@ class TestProcessRequest:
 
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid JSON in request body"
+        # A client sending malformed JSON is not a proxy defect — must not be
+        # error-level, or Sentry's logging integration captures it (LUTHIEN-7/9).
+        malformed_json_records = [r for r in caplog.records if "Malformed JSON" in r.message]
+        assert malformed_json_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.WARNING for r in malformed_json_records)
 
     @pytest.mark.asyncio
     async def test_missing_model_returns_400(self, mock_request, mock_emitter, mock_span):
@@ -843,6 +853,26 @@ class TestBuildErrorEvent:
         assert event.get("error", {}).get("type") == "api_connection_error"
         assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
 
+    def test_builds_transport_error_event_and_logs_at_warning(self, caplog):
+        """httpx errors raised directly (not wrapped by the Anthropic SDK) when the
+        upstream connection drops mid-stream are the backend's network, not a proxy
+        defect (LUTHIEN-A/B/G) — must log at warning, not error."""
+        mock_request = HttpxRequest("POST", "https://api.anthropic.com/v1/messages")
+        error = httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body (incomplete chunked read)",
+            request=mock_request,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="luthien_proxy.pipeline.anthropic_processor"):
+            event = _build_error_event(error, "test-call-id")
+
+        assert event.get("type") == "error"
+        assert event.get("error", {}).get("type") == "api_connection_error"
+        assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
+        transport_records = [r for r in caplog.records if "Mid-stream transport error" in r.message]
+        assert transport_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.WARNING for r in transport_records)
+
     def test_builds_generic_error_event(self):
         """Generic exceptions produce a sanitized error event — internal details are not forwarded."""
         error = RuntimeError("Something went wrong")
@@ -852,6 +882,18 @@ class TestBuildErrorEvent:
         assert event.get("type") == "error"
         assert event.get("error", {}).get("type") == "api_error"
         assert event.get("error", {}).get("message") == "An internal error occurred while processing the request."
+
+    def test_builds_generic_error_event_logs_at_error(self, caplog):
+        """A genuine proxy bug mid-stream must still be error-level and visible —
+        the httpx.TransportError carve-out must not swallow real defects."""
+        error = RuntimeError("Something went wrong")
+
+        with caplog.at_level(logging.ERROR, logger="luthien_proxy.pipeline.anthropic_processor"):
+            _build_error_event(error, "test-call-id")
+
+        error_records = [r for r in caplog.records if "Mid-stream error" in r.message]
+        assert error_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in error_records)
 
 
 class TestMidStreamErrorHandling:

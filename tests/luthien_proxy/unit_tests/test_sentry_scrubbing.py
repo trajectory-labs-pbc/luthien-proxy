@@ -175,6 +175,35 @@ class TestBeforeSend:
         result = _sentry_before_send(event, {"exc_info": "not-a-tuple"})
         assert result is not None
 
+    def test_drops_client_disconnect(self):
+        """Client walked away mid-body-read — starlette.requests.ClientDisconnect,
+        always unhandled, never a proxy defect (LUTHIEN-3/4/E)."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {"values": [{"type": "ClientDisconnect", "module": "starlette.requests", "value": None}]}
+        assert _sentry_before_send(event, {}) is None
+
+    def test_drops_client_disconnect_flattened_from_exception_group(self):
+        """anyio's TaskGroup wraps a mid-body ClientDisconnect in an ExceptionGroup;
+        the SDK flattens both into event["exception"]["values"] before before_send
+        runs, so the group wrapper must not hide the member we want dropped."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {
+            "values": [
+                {"type": "ExceptionGroup", "module": None, "value": "unhandled errors in a TaskGroup"},
+                {"type": "ClientDisconnect", "module": "starlette.requests", "value": None},
+            ]
+        }
+        assert _sentry_before_send(event, {}) is None
+
+    def test_keeps_same_named_exception_from_different_module(self):
+        """Matching is (module, type), not type alone, so an unrelated class that
+        happens to share the name ClientDisconnect is not silently swallowed."""
+        event = self._make_event(include_exception=False)
+        event["exception"] = {
+            "values": [{"type": "ClientDisconnect", "module": "some_other_package.errors", "value": None}]
+        }
+        assert _sentry_before_send(event, {}) is not None
+
     def test_strips_server_name(self):
         event = self._make_event()
         hint = {}
