@@ -1180,19 +1180,34 @@ class TestHandleAnthropicError:
         assert exc_info.value.status_code == 502
         assert exc_info.value.error_type == "api_connection_error"
 
-    def test_upstream_transport_error_raises_backend_api_error(self):
+    def test_upstream_transport_error_raises_backend_api_error_and_logs_at_error(self, caplog):
         """AnthropicUpstreamTransportError (raised by AnthropicClient when the
         actual upstream connection drops) should raise BackendAPIError with 502
         — previously this exception type wasn't classified at all in the
         non-streaming path and propagated as an unclassified 500
-        (thermonuclear-deep-review finding on PR #814)."""
+        (thermonuclear-deep-review finding on PR #814). It MUST also log at
+        ERROR, not WARNING.
+
+        Pins the contract with Datadog monitor 21915707
+        (`meta/infra/pulumi/components/datadog/luthien_error_monitor.py`), which pages on a
+        single non-OTEL ERROR line: `logs("service:luthien-proxy env:production status:error
+        -@logger:opentelemetry.*").index("*").rollup("count").last("5m") > 0`, critical="0".
+        This is the ONLY alert for this failure class. It was downgraded to WARNING in
+        fix/sentry-expected-client-and-network-noise and restored here: if it drifts back to
+        WARNING, non-streaming upstream transport failures go completely silent — no Datadog
+        page, and no Sentry event either (Sentry's LoggingIntegration only captures at ERROR
+        by default).
+        """
         exc = AnthropicUpstreamTransportError("peer closed connection")
 
-        with pytest.raises(BackendAPIError) as exc_info:
+        with caplog.at_level(logging.WARNING), pytest.raises(BackendAPIError) as exc_info:
             _handle_anthropic_error(exc, "test-call")
 
         assert exc_info.value.status_code == 502
         assert exc_info.value.error_type == "api_connection_error"
+        transport_records = [r for r in caplog.records if "Anthropic upstream transport error" in r.message]
+        assert transport_records, f"expected a log record; got {[r.message for r in caplog.records]}"
+        assert all(r.levelno == logging.ERROR for r in transport_records)
 
 
 class _InvalidStreamCompletePolicy:

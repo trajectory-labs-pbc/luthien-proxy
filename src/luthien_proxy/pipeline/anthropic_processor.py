@@ -1315,7 +1315,15 @@ def _handle_anthropic_error(e: Exception, call_id: str) -> None:
         # Same upstream-network carve-out as _build_error_event's mid-stream
         # branch, for the non-streaming path — previously this fell through
         # to "let them propagate" and surfaced as an unclassified 500.
-        logger.warning(f"[{call_id}] Anthropic upstream transport error: {repr(e)}")
+        #
+        # Stays ERROR, not WARNING: Datadog monitor 21915707 pages on a
+        # single non-OTEL ERROR line — `service:luthien-proxy
+        # env:production status:error -@logger:opentelemetry.*` rolled up
+        # over 5m, `critical="0"` — and is the only alert for this failure
+        # class. If this Sentry noise still needs trimming, do it in
+        # observability/sentry.py's before_send, not by touching this log
+        # level.
+        logger.error(f"[{call_id}] Anthropic upstream transport error: {repr(e)}")
         raise BackendAPIError(
             status_code=502,
             message=client_error_detail(str(e), "An error occurred while connecting to the API."),
