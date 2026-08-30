@@ -793,7 +793,14 @@ async def _handle_execution_streaming(
                     )
                     if isinstance(e, AnthropicStatusError):
                         final_status = e.status_code or 500
-                    elif isinstance(e, AnthropicConnectionError):
+                    elif isinstance(e, AnthropicConnectionError | AnthropicUpstreamTransportError):
+                        # AnthropicUpstreamTransportError is AnthropicClient's own
+                        # wrapper around a network-level transport failure talking
+                        # to Anthropic (see llm/anthropic_client.py) — same
+                        # upstream-network bucket as AnthropicConnectionError, not
+                        # a proxy defect. Without this branch it fell through to
+                        # the generic 500 below, misclassifying an upstream outage
+                        # as a proxy bug in the completion webhook / request log.
                         final_status = 503
                     else:
                         final_status = 500

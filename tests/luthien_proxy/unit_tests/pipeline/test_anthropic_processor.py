@@ -2303,6 +2303,57 @@ class TestStreamingWebhookGate:
         assert kwargs["http_status"] == 500
 
     @pytest.mark.asyncio
+    async def test_mid_stream_upstream_transport_error_fires_with_503(self):
+        """AnthropicUpstreamTransportError mid-stream → error event classified as
+        api_connection_error, webhook AND request-log status 503 — the same
+        upstream-network bucket as AnthropicConnectionError, not a proxy 500.
+
+        Regression for the finding that this exception type fell through to
+        the generic `else: final_status = 500` branch, misclassifying an
+        Anthropic-side network outage as a proxy bug in the completion
+        webhook and request-log rows.
+        """
+        from luthien_proxy.llm.anthropic_client import AnthropicUpstreamTransportError
+        from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
+
+        transport_error = AnthropicUpstreamTransportError("peer closed connection without sending complete message")
+
+        async def emissions():
+            yield self._make_event()
+            raise transport_error
+
+        io, span, ctx, recorder, emitter = self._make_deps()
+        webhook = MagicMock()
+        webhook.enabled = True
+        webhook.fire_and_forget = MagicMock()
+
+        response = await _handle_execution_streaming(
+            emissions=emissions(),
+            io=io,
+            call_id="call-transport-error",
+            root_span=span,
+            policy_ctx=ctx,
+            request_log_recorder=recorder,
+            emitter=emitter,
+            webhook_sender=webhook,
+            request_start_time=0.0,
+        )
+        chunks = await self._drain(response)
+
+        # Emitted error event is classified as api_connection_error (_build_error_event).
+        body_text = b"".join(chunks).decode()
+        assert "event: error" in body_text
+        assert '"type": "api_connection_error"' in body_text
+
+        # Webhook AND request-log both record the upstream-network status, not 500.
+        webhook.fire_and_forget.assert_called_once()
+        kwargs = webhook.fire_and_forget.call_args.kwargs
+        assert kwargs["success"] is False
+        assert kwargs["http_status"] == 503
+        recorder.record_inbound_response.assert_called_once_with(status=503)
+        recorder.record_outbound_response.assert_called_once_with(status=503)
+
+    @pytest.mark.asyncio
     async def test_empty_stream_fires_with_success_false_500(self):
         """Policy emits nothing → empty-stream branch fires with success=False, http_status=500."""
         from luthien_proxy.pipeline.anthropic_processor import _handle_execution_streaming
