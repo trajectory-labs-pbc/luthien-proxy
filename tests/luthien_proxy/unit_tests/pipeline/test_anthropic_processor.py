@@ -318,8 +318,19 @@ class TestProcessRequest:
         assert "payload too large" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_malformed_json_returns_400(self, mock_request, mock_emitter, mock_span, caplog):
-        """Test that malformed JSON in request body returns 400 error."""
+    async def test_malformed_json_returns_400_and_logs_at_error(self, mock_request, mock_emitter, mock_span, caplog):
+        """Malformed-JSON handling returns 400 AND must log at ERROR, never WARNING.
+
+        Pins the contract with Datadog monitor 21915707
+        (`meta/infra/pulumi/components/datadog/luthien_error_monitor.py`), which pages on a
+        single non-OTEL ERROR line: `logs("service:luthien-proxy env:production status:error
+        -@logger:opentelemetry.*").index("*").rollup("count").last("5m") > 0`, critical="0".
+        This is the ONLY alert for this failure class. It was downgraded to WARNING in
+        fix/sentry-expected-client-and-network-noise (to cut Sentry noise, LUTHIEN-7/9) and
+        restored here: if it drifts back to WARNING, a serialization regression that 400s
+        every sample goes completely silent — no Datadog page, and no Sentry event either
+        (Sentry's LoggingIntegration only captures at ERROR by default).
+        """
         mock_request.json = AsyncMock(side_effect=json.JSONDecodeError("Expecting value", "", 0))
 
         with (
@@ -338,11 +349,9 @@ class TestProcessRequest:
 
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid JSON in request body"
-        # A client sending malformed JSON is not a proxy defect — must not be
-        # error-level, or Sentry's logging integration captures it (LUTHIEN-7/9).
         malformed_json_records = [r for r in caplog.records if "Malformed JSON" in r.message]
         assert malformed_json_records, f"expected a log record; got {[r.message for r in caplog.records]}"
-        assert all(r.levelno == logging.WARNING for r in malformed_json_records)
+        assert all(r.levelno == logging.ERROR for r in malformed_json_records)
 
     @pytest.mark.asyncio
     async def test_missing_model_returns_400(self, mock_request, mock_emitter, mock_span):
@@ -854,10 +863,20 @@ class TestBuildErrorEvent:
         assert event.get("error", {}).get("type") == "api_connection_error"
         assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
 
-    def test_builds_transport_error_event_and_logs_at_warning(self, caplog):
+    def test_builds_transport_error_event_and_logs_at_error(self, caplog):
         """AnthropicUpstreamTransportError — raised by AnthropicClient when the
-        actual upstream connection drops mid-stream — is the backend's network,
-        not a proxy defect (LUTHIEN-A/B/G) — must log at warning, not error."""
+        actual upstream connection drops mid-stream — is the backend's network, not a proxy
+        defect (LUTHIEN-A/B/G), but it MUST still log at ERROR, not WARNING.
+
+        Pins the contract with Datadog monitor 21915707
+        (`meta/infra/pulumi/components/datadog/luthien_error_monitor.py`), which pages on a
+        single non-OTEL ERROR line: `logs("service:luthien-proxy env:production status:error
+        -@logger:opentelemetry.*").index("*").rollup("count").last("5m") > 0`, critical="0".
+        This is the ONLY alert for this failure class. It was downgraded to WARNING in
+        fix/sentry-expected-client-and-network-noise and restored here: if it drifts back to
+        WARNING, upstream transport failures go completely silent — no Datadog page, and no
+        Sentry event either (Sentry's LoggingIntegration only captures at ERROR by default).
+        """
         error = AnthropicUpstreamTransportError(
             "peer closed connection without sending complete message body (incomplete chunked read)"
         )
@@ -870,7 +889,7 @@ class TestBuildErrorEvent:
         assert event.get("error", {}).get("message") == "An error occurred while connecting to the API."
         transport_records = [r for r in caplog.records if "Mid-stream transport error" in r.message]
         assert transport_records, f"expected a log record; got {[r.message for r in caplog.records]}"
-        assert all(r.levelno == logging.WARNING for r in transport_records)
+        assert all(r.levelno == logging.ERROR for r in transport_records)
 
     def test_builds_generic_error_event_for_policy_origin_transport_error(self, caplog):
         """A raw httpx.TransportError NOT raised by AnthropicClient (e.g. from a

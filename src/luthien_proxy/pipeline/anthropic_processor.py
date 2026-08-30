@@ -510,9 +510,14 @@ async def _process_request(
         try:
             body = await request.json()
         except json.JSONDecodeError as e:
-            # Client sent invalid JSON — not a proxy defect (LUTHIEN-7/9); the
-            # 400 below is the actionable response to the client.
-            logger.warning(f"[{call_id}] Malformed JSON in Anthropic request: {repr(e)}")
+            # Stays ERROR, not WARNING (LUTHIEN-7/9 notwithstanding): Datadog
+            # monitor 21915707 pages on a single non-OTEL ERROR line —
+            # `service:luthien-proxy env:production status:error
+            # -@logger:opentelemetry.*` rolled up over 5m, `critical="0"` — and
+            # is the only alert for this failure class. If this Sentry noise
+            # still needs trimming, do it in observability/sentry.py's
+            # before_send, not by touching this log level.
+            logger.error(f"[{call_id}] Malformed JSON in Anthropic request: {repr(e)}")
             raise HTTPException(status_code=400, detail="Invalid JSON in request body")
         headers = {k.lower(): v for k, v in request.headers.items()}
 
@@ -1219,10 +1224,18 @@ def _build_error_event(e: Exception, call_id: str) -> _StreamErrorEvent:
         # network, not a proxy defect (LUTHIEN-A/B/G). A raw
         # httpx.TransportError raised anywhere else (e.g. a policy's own
         # outbound call) is NOT this type and falls to the generic branch
-        # below, where it stays error-level and visible.
+        # below.
+        #
+        # Stays ERROR, not WARNING: Datadog monitor 21915707 pages on a
+        # single non-OTEL ERROR line — `service:luthien-proxy
+        # env:production status:error -@logger:opentelemetry.*` rolled up
+        # over 5m, `critical="0"` — and is the only alert for this failure
+        # class. If this Sentry noise still needs trimming, do it in
+        # observability/sentry.py's before_send, not by touching this log
+        # level.
         error_type = "api_connection_error"
         message = client_error_detail(str(e), "An error occurred while connecting to the API.")
-        logger.warning(f"[{call_id}] Mid-stream transport error: {repr(e)}")
+        logger.error(f"[{call_id}] Mid-stream transport error: {repr(e)}")
     else:
         error_type = "api_error"
         message = client_error_detail(str(e), "An internal error occurred while processing the request.")
