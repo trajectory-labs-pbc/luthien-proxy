@@ -5,6 +5,9 @@ import logging
 import pytest
 
 from luthien_proxy.observability.sentry import (
+    _CONTENT_DEPENDENT_STATUS_CODES,
+    _CREDENTIAL_DEPENDENT_STATUS_CODES,
+    _PROVIDER_SIDE_STATUS_CODES,
     CREDENTIAL_PASSTHROUGH_TAG,
     PASSTHROUGH_TAG,
     _sentry_before_send,
@@ -295,6 +298,67 @@ class TestBeforeSend:
         exc = self._status_error(400)
         event = self._make_event()
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
+
+    # ------------------------------------------------------------------
+    # Decision-table coverage. Parametrized directly off the production
+    # status-code sets in observability/sentry.py, so a status silently
+    # added to (or removed from) one of those sets changes which cases these
+    # tests run without anyone having to remember to update a hand-written
+    # list here. The named tests above stay as regression pins for specific
+    # incidents; these supplement them with exhaustive tag-combination
+    # coverage.
+    # ------------------------------------------------------------------
+
+    _TAG_STATES = (True, False, None)  # None means the tag is absent entirely
+
+    def _tags_for(self, passthrough: bool | None, credential: bool | None) -> dict[str, object]:
+        tags: dict[str, object] = {}
+        if passthrough is not None:
+            tags[PASSTHROUGH_TAG] = passthrough
+        if credential is not None:
+            tags[CREDENTIAL_PASSTHROUGH_TAG] = credential
+        return tags
+
+    @pytest.mark.parametrize("status", sorted(_PROVIDER_SIDE_STATUS_CODES))
+    def test_decision_table_provider_side_drops_with_no_tags(self, status):
+        """Every status in _PROVIDER_SIDE_STATUS_CODES drops unconditionally —
+        no PASSTHROUGH_TAG or CREDENTIAL_PASSTHROUGH_TAG needed. Parametrized
+        from the set itself, so adding a status there without exercising it
+        here is not possible."""
+        exc = self._status_error(status)
+        event = self._make_event()
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    @pytest.mark.parametrize("status", sorted(_CONTENT_DEPENDENT_STATUS_CODES))
+    @pytest.mark.parametrize("credential", _TAG_STATES, ids=lambda v: f"credential={v}")
+    @pytest.mark.parametrize("passthrough", _TAG_STATES, ids=lambda v: f"passthrough={v}")
+    def test_decision_table_content_dependent(self, passthrough, credential, status):
+        """400/404 drop iff PASSTHROUGH_TAG is True; the credential tag never
+        matters, in every one of the 9 tag combinations — pinning the
+        deliberate fix that content-only statuses don't gate on credential
+        provenance."""
+        exc = self._status_error(status)
+        event = self._make_event(tags=self._tags_for(passthrough, credential))
+        result = _sentry_before_send(event, {"exc_info": (type(exc), exc, None)})
+        if passthrough is True:
+            assert result is None
+        else:
+            assert result is not None
+
+    @pytest.mark.parametrize("status", sorted(_CREDENTIAL_DEPENDENT_STATUS_CODES))
+    @pytest.mark.parametrize("credential", _TAG_STATES, ids=lambda v: f"credential={v}")
+    @pytest.mark.parametrize("passthrough", _TAG_STATES, ids=lambda v: f"passthrough={v}")
+    def test_decision_table_credential_dependent(self, passthrough, credential, status):
+        """401 drops only when BOTH PASSTHROUGH_TAG and CREDENTIAL_PASSTHROUGH_TAG
+        are True; every other one of the 9 combinations — including either
+        tag simply missing — must fail closed and still report."""
+        exc = self._status_error(status)
+        event = self._make_event(tags=self._tags_for(passthrough, credential))
+        result = _sentry_before_send(event, {"exc_info": (type(exc), exc, None)})
+        if passthrough is True and credential is True:
+            assert result is None
+        else:
+            assert result is not None
 
     def test_keeps_upstream_status_code_outside_expected_set(self):
         """A status code we have not classified as expected (e.g. 403) still reports,

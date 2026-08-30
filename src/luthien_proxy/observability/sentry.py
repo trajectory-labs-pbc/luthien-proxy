@@ -104,6 +104,19 @@ PASSTHROUGH_TAG = "luthien.request_unmodified_passthrough"
 # this — a bad body/model name (400/404) is credential-independent.
 CREDENTIAL_PASSTHROUGH_TAG = "luthien.credential_client_supplied"
 
+# The decision table itself: which scope tags (all must be True) are required
+# to drop each expected-upstream status code. Empty for the provider-side
+# codes (unconditional), PASSTHROUGH_TAG alone for the content-dependent
+# codes, both tags for the credential-dependent code. Built from the sets
+# above so it cannot drift from the per-category documentation there, and a
+# status absent from every set above is absent here too, so it always
+# reports — see _is_expected_upstream_error.
+_REQUIRED_TAGS_BY_STATUS: dict[int, tuple[str, ...]] = {
+    **dict.fromkeys(_PROVIDER_SIDE_STATUS_CODES, ()),
+    **dict.fromkeys(_CONTENT_DEPENDENT_STATUS_CODES, (PASSTHROUGH_TAG,)),
+    **dict.fromkeys(_CREDENTIAL_DEPENDENT_STATUS_CODES, (PASSTHROUGH_TAG, CREDENTIAL_PASSTHROUGH_TAG)),
+}
+
 
 def tag_request_provenance(unmodified: bool) -> None:
     """Record on the current Sentry scope whether the outgoing request is untouched.
@@ -169,22 +182,16 @@ def _is_expected_upstream_error(exc: BaseException | None, tags: Mapping[str, ob
 
     Matches on the SDK exception's own status_code rather than its class so a
     provider SDK renaming or adding a status subclass cannot silently start
-    reporting again. 400/404 additionally require the PASSTHROUGH_TAG scope
-    tag proving the proxy relayed the request unchanged; 401 requires that
-    PLUS the CREDENTIAL_PASSTHROUGH_TAG proving the forwarded credential was
-    the client's own — see _CONTENT_DEPENDENT_STATUS_CODES and
-    _CREDENTIAL_DEPENDENT_STATUS_CODES above.
+    reporting again. Looks up the required scope tags for that status in
+    _REQUIRED_TAGS_BY_STATUS and drops only when every one of them is True;
+    a status with no entry there always reports.
     """
     if not isinstance(exc, APIStatusError):
         return False
-    status = exc.status_code
-    if status in _PROVIDER_SIDE_STATUS_CODES:
-        return True
-    if status in _CONTENT_DEPENDENT_STATUS_CODES:
-        return tags.get(PASSTHROUGH_TAG) is True
-    if status in _CREDENTIAL_DEPENDENT_STATUS_CODES:
-        return tags.get(PASSTHROUGH_TAG) is True and tags.get(CREDENTIAL_PASSTHROUGH_TAG) is True
-    return False
+    required_tags = _REQUIRED_TAGS_BY_STATUS.get(exc.status_code)
+    if required_tags is None:
+        return False
+    return all(tags.get(tag) is True for tag in required_tags)
 
 
 def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
