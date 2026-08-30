@@ -4,7 +4,12 @@ import logging
 
 import pytest
 
-from luthien_proxy.observability.sentry import PASSTHROUGH_TAG, _sentry_before_send, _summarize
+from luthien_proxy.observability.sentry import (
+    CREDENTIAL_PASSTHROUGH_TAG,
+    PASSTHROUGH_TAG,
+    _sentry_before_send,
+    _summarize,
+)
 
 pytestmark = pytest.mark.timeout(10)
 
@@ -208,6 +213,17 @@ class TestBeforeSend:
         event = self._make_event(tags={PASSTHROUGH_TAG: True})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
 
+    def test_drops_bad_request_error_regardless_of_credential_tag(self):
+        """400 is credential-independent: a client-key-mode request (server's
+        shared ANTHROPIC_API_KEY forwarded, CREDENTIAL_PASSTHROUGH_TAG False)
+        with an unmodified body must still drop a 400 — the operator's
+        credential has nothing to do with a malformed message the client
+        sent. Regression guard for the credential-provenance fix
+        overcorrecting into gating 400/404 too."""
+        exc = self._status_error(400)
+        event = self._make_event(tags={PASSTHROUGH_TAG: True, CREDENTIAL_PASSTHROUGH_TAG: False})
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
     def test_drops_upstream_not_found_error(self):
         """A 404 means the client asked for a model Anthropic doesn't have (LUTHIEN-2),
         and the PASSTHROUGH_TAG proves the proxy didn't rewrite the request."""
@@ -215,13 +231,41 @@ class TestBeforeSend:
         event = self._make_event(tags={PASSTHROUGH_TAG: True})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
 
+    def test_drops_not_found_error_regardless_of_credential_tag(self):
+        """Same regression guard as the 400 case: an unknown model name is
+        credential-independent, so a 404 still drops in client-key mode."""
+        exc = self._status_error(404)
+        event = self._make_event(tags={PASSTHROUGH_TAG: True, CREDENTIAL_PASSTHROUGH_TAG: False})
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
     def test_drops_upstream_authentication_error(self):
         """A 401 means the credential passed through to Anthropic was invalid
-        (LUTHIEN-D) — the proxy correctly forwarded a bad token, it didn't mint one,
-        proven by the PASSTHROUGH_TAG."""
+        (LUTHIEN-D) — the proxy correctly forwarded a bad token, it didn't mint
+        one. Dropping requires BOTH PASSTHROUGH_TAG (request untouched) AND
+        CREDENTIAL_PASSTHROUGH_TAG (the forwarded credential was the client's
+        own, not the operator's shared key)."""
+        exc = self._status_error(401)
+        event = self._make_event(tags={PASSTHROUGH_TAG: True, CREDENTIAL_PASSTHROUGH_TAG: True})
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+
+    def test_keeps_client_key_mode_authentication_error(self):
+        """A 401 with an unmodified body (PASSTHROUGH_TAG True) but the
+        operator's shared credential forwarded instead of the client's own
+        (CREDENTIAL_PASSTHROUGH_TAG False, client-key auth mode) must still
+        report — the operator's credential is invalid, not the client's, and
+        dropping it would silently hide the outage. This is the deep-review
+        finding that PR #809's original PASSTHROUGH_TAG-only check missed."""
+        exc = self._status_error(401)
+        event = self._make_event(tags={PASSTHROUGH_TAG: True, CREDENTIAL_PASSTHROUGH_TAG: False})
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
+
+    def test_keeps_authentication_error_when_credential_tag_absent(self):
+        """No CREDENTIAL_PASSTHROUGH_TAG at all (e.g. the tag was never set)
+        must fail closed for a 401 — absence of proof is not proof of
+        passthrough, same rule PASSTHROUGH_TAG already follows."""
         exc = self._status_error(401)
         event = self._make_event(tags={PASSTHROUGH_TAG: True})
-        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
+        assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
 
     def test_keeps_proxy_modified_bad_request_error(self):
         """A 400 where the request was NOT proven to be an unmodified client

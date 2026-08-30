@@ -61,37 +61,71 @@ _LLM_CONTENT_VARS = {
 # existed).
 _PROVIDER_SIDE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
 
-# 400/404/401: *usually* the client sent something the provider legitimately
-# rejected — malformed message content, an unknown model name, or an invalid
-# bearer token passed through client-credential mode (LUTHIEN-6: 1,080 events
-# for one recurring 400; LUTHIEN-2: unknown-model 404s; LUTHIEN-D:
-# invalid-token 401s). But the proxy is not always a transparent passthrough:
-# policy hooks can mutate or replace the request before it reaches Anthropic,
-# and operator-configured UPSTREAM_HEADERS or policy-context injection can
-# alter it too — any of those could turn a proxy bug into what looks like a
-# provider rejection. Only drop these when the request carries provenance
-# (the PASSTHROUGH_TAG scope tag, set at the actual upstream call boundary in
-# _AnthropicPolicyIO) proving nothing touched it after the client sent it.
-_CLIENT_OR_PASSTHROUGH_STATUS_CODES = frozenset({400, 401, 404})
+# 400/404: the client sent content Anthropic legitimately rejected —
+# malformed message content or an unknown model name (LUTHIEN-6: 1,080
+# events for one recurring 400; LUTHIEN-2: unknown-model 404s). This is a
+# property of the request body alone, independent of which credential
+# reached Anthropic. But the proxy is not always a transparent passthrough:
+# policy hooks can mutate or replace the request before it reaches
+# Anthropic, and operator-configured UPSTREAM_HEADERS or policy-context
+# injection can alter it too. Only drop these when the request carries
+# provenance (the PASSTHROUGH_TAG scope tag, set at the actual upstream
+# call boundary in _AnthropicPolicyIO) proving nothing touched it after the
+# client sent it.
+_CONTENT_DEPENDENT_STATUS_CODES = frozenset({400, 404})
+
+# 401: an invalid bearer token passed through client-credential mode
+# (LUTHIEN-D). Unlike 400/404, this is NOT solely a body/header property: in
+# client-key auth mode the *credential* forwarded upstream is the operator's
+# own ANTHROPIC_API_KEY rather than anything the client sent, so an
+# unmodified body proves nothing about whose credential caused the 401 in
+# that mode — an invalid operator credential must still report. Dropping a
+# 401 requires BOTH the PASSTHROUGH_TAG (request untouched) AND the
+# CREDENTIAL_PASSTHROUGH_TAG (credential is the client's own, not the
+# operator's shared key).
+_CREDENTIAL_DEPENDENT_STATUS_CODES = frozenset({401})
+
+_CLIENT_OR_PASSTHROUGH_STATUS_CODES = _CONTENT_DEPENDENT_STATUS_CODES | _CREDENTIAL_DEPENDENT_STATUS_CODES
 
 _EXPECTED_UPSTREAM_STATUS_CODES = _PROVIDER_SIDE_STATUS_CODES | _CLIENT_OR_PASSTHROUGH_STATUS_CODES
 
 # Scope tag set by the Anthropic pipeline (see _AnthropicPolicyIO in
-# anthropic_processor.py) immediately before the upstream call, when the
-# request body and headers going to Anthropic are exactly what the client
-# sent — no policy hook, header injection, or context injection touched them.
+# anthropic_processor.py) immediately before the upstream call, true only
+# when the request body and headers going to Anthropic are exactly what the
+# client sent — no policy hook, header injection, or context injection
+# touched them. Says nothing about which credential was forwarded; see
+# CREDENTIAL_PASSTHROUGH_TAG for that.
 PASSTHROUGH_TAG = "luthien.request_unmodified_passthrough"
+
+# Scope tag set alongside PASSTHROUGH_TAG, true only when the credential
+# forwarded to Anthropic is the client's own (passthrough / BOTH / explicit
+# x-anthropic-api-key auth) rather than the operator's shared
+# ANTHROPIC_API_KEY substituted in client-key auth mode. Only 401 needs
+# this — a bad body/model name (400/404) is credential-independent.
+CREDENTIAL_PASSTHROUGH_TAG = "luthien.credential_client_supplied"
 
 
 def tag_request_provenance(unmodified: bool) -> None:
     """Record on the current Sentry scope whether the outgoing request is untouched.
 
     Called at the upstream call boundary so `_sentry_before_send` can tell a
-    genuine client/provider 400/401/404 from one the proxy or a policy
-    caused. Safe to call even when Sentry is disabled or uninitialized —
+    genuine client/provider 400/404 from one the proxy or a policy caused.
+    Safe to call even when Sentry is disabled or uninitialized —
     `sentry_sdk.set_tag` is a no-op against the default scope in that case.
     """
     sentry_sdk.set_tag(PASSTHROUGH_TAG, unmodified)
+
+
+def tag_credential_provenance(client_supplied: bool) -> None:
+    """Record on the current Sentry scope whether the forwarded credential is the client's own.
+
+    Called at the upstream call boundary alongside `tag_request_provenance`
+    so `_sentry_before_send` can tell a genuine client credential failure
+    (401) from an invalid operator credential in client-key auth mode. Safe
+    to call even when Sentry is disabled or uninitialized —
+    `sentry_sdk.set_tag` is a no-op against the default scope in that case.
+    """
+    sentry_sdk.set_tag(CREDENTIAL_PASSTHROUGH_TAG, client_supplied)
 
 
 _SAFE_REQUEST_KEYS = {"model", "stream", "max_tokens", "temperature", "top_p", "top_k"}
@@ -135,17 +169,21 @@ def _is_expected_upstream_error(exc: BaseException | None, tags: Mapping[str, ob
 
     Matches on the SDK exception's own status_code rather than its class so a
     provider SDK renaming or adding a status subclass cannot silently start
-    reporting again. 400/401/404 additionally require the PASSTHROUGH_TAG
-    scope tag proving the proxy relayed the request unchanged — see
-    _CLIENT_OR_PASSTHROUGH_STATUS_CODES above.
+    reporting again. 400/404 additionally require the PASSTHROUGH_TAG scope
+    tag proving the proxy relayed the request unchanged; 401 requires that
+    PLUS the CREDENTIAL_PASSTHROUGH_TAG proving the forwarded credential was
+    the client's own — see _CONTENT_DEPENDENT_STATUS_CODES and
+    _CREDENTIAL_DEPENDENT_STATUS_CODES above.
     """
     if not isinstance(exc, APIStatusError):
         return False
     status = exc.status_code
     if status in _PROVIDER_SIDE_STATUS_CODES:
         return True
-    if status in _CLIENT_OR_PASSTHROUGH_STATUS_CODES:
+    if status in _CONTENT_DEPENDENT_STATUS_CODES:
         return tags.get(PASSTHROUGH_TAG) is True
+    if status in _CREDENTIAL_DEPENDENT_STATUS_CODES:
+        return tags.get(PASSTHROUGH_TAG) is True and tags.get(CREDENTIAL_PASSTHROUGH_TAG) is True
     return False
 
 

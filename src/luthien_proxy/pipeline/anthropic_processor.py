@@ -50,7 +50,7 @@ from luthien_proxy.llm.types.anthropic import (
     build_usage,
 )
 from luthien_proxy.observability.emitter import EventEmitterProtocol
-from luthien_proxy.observability.sentry import tag_request_provenance
+from luthien_proxy.observability.sentry import tag_credential_provenance, tag_request_provenance
 from luthien_proxy.pipeline.client_format import ClientFormat
 from luthien_proxy.pipeline.policy_context_injection import inject_policy_awareness_anthropic
 from luthien_proxy.pipeline.session import (
@@ -112,6 +112,7 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         request_log_recorder: RequestLogRecorder,
         is_streaming: bool,
         client_request_unmodified: bool,
+        credential_passthrough: bool,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         self._request = initial_request
@@ -137,6 +138,13 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         # comparison in _tag_provenance to decide passthrough provenance for
         # Sentry (see observability/sentry.py:PASSTHROUGH_TAG).
         self._client_request_unmodified = client_request_unmodified
+        # Whether the credential forwarded upstream is the client's own
+        # (passthrough / x-anthropic-api-key auth) rather than the
+        # operator's shared ANTHROPIC_API_KEY substituted in client-key auth
+        # mode — see process_anthropic_request. A 401 caused by an invalid
+        # *operator* credential must never be tagged CREDENTIAL_PASSTHROUGH_TAG
+        # just because the request body was untouched.
+        self._credential_passthrough = credential_passthrough
         self._request_recorded = False
         self._first_backend_response: AnthropicResponse | None = None
         # Raw backend events are only buffered when needed for non-streaming
@@ -198,16 +206,20 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         )
 
     def _tag_request_provenance(self, final_request: AnthropicRequest) -> None:
-        """Tag the Sentry scope with whether `final_request` is untouched.
+        """Tag the Sentry scope with the request and credential provenance.
 
         `self._client_request_unmodified` covers pipeline-level changes made
         before any policy hook ran (context injection, UPSTREAM_HEADERS);
         comparing `final_request` against the pre-hook snapshot
         (`self._initial_request`) covers what a policy hook did to it. Both
-        must hold for the request to be a genuine client passthrough.
+        must hold for PASSTHROUGH_TAG (body/headers untouched). Credential
+        provenance is tagged separately via CREDENTIAL_PASSTHROUGH_TAG since
+        a bad body/model name (400/404) is credential-independent — only a
+        401 needs both tags true (see observability/sentry.py).
         """
         unmodified = self._client_request_unmodified and final_request == self._initial_request
         tag_request_provenance(unmodified)
+        tag_credential_provenance(self._credential_passthrough)
 
     async def complete(self, request: AnthropicRequest | None = None) -> AnthropicResponse:
         """Execute a non-streaming backend request."""
@@ -468,6 +480,15 @@ async def process_anthropic_request(
         # to decide the final Sentry PASSTHROUGH_TAG (observability/sentry.py).
         client_request_unmodified = anthropic_request == raw_http_request.body and not upstream_injected_headers
 
+        # Whether the credential Anthropic will see is the client's own, not
+        # the operator's shared ANTHROPIC_API_KEY. resolve_anthropic_client
+        # (gateway_routes.py) passes `user_credential=None` exactly when a
+        # client-key-mode request matched the shared key and the server's own
+        # base_client/credential is forwarded instead — that branch is never
+        # a client passthrough no matter how untouched the body is, since a
+        # 401 there means the *operator's* credential is invalid.
+        credential_passthrough = user_credential is not None
+
         # Create policy cache factory if database is available. The cap is
         # configured once here so every policy's cache honors the same limit;
         # 0-or-negative in settings means "unbounded" (pass None to the cache).
@@ -503,6 +524,7 @@ async def process_anthropic_request(
             root_span=root_span,
             request_log_recorder=request_log_recorder,
             client_request_unmodified=client_request_unmodified,
+            credential_passthrough=credential_passthrough,
             extra_headers=forwarded_headers,
             usage_collector=usage_collector,
             webhook_sender=webhook_sender,
@@ -658,6 +680,7 @@ async def _execute_anthropic_policy(
     request_log_recorder: RequestLogRecorder,
     request_start_time: float,
     client_request_unmodified: bool,
+    credential_passthrough: bool,
     extra_headers: dict[str, str] | None = None,
     usage_collector: UsageCollector | None = None,
     webhook_sender: WebhookSender | None = None,
@@ -673,6 +696,7 @@ async def _execute_anthropic_policy(
         request_log_recorder=request_log_recorder,
         is_streaming=is_streaming,
         client_request_unmodified=client_request_unmodified,
+        credential_passthrough=credential_passthrough,
         extra_headers=extra_headers,
     )
     emissions = _run_policy_hooks(execution_policy, io, policy_ctx)
