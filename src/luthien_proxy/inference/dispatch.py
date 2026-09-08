@@ -45,6 +45,7 @@ from luthien_proxy.credentials import (
 )
 from luthien_proxy.inference.base import InferenceProvider
 from luthien_proxy.inference.direct_api import DirectApiProvider
+from luthien_proxy.settings import get_settings
 
 if TYPE_CHECKING:
     from luthien_proxy.inference.registry import InferenceProviderRegistry
@@ -187,11 +188,15 @@ def _passthrough(
             "server-side provider via {'provider': 'name'} / "
             "{'user_then_provider': {'name': 'x', 'on_fallback': 'warn'}}."
         )
+    # The request credential is only valid at the gateway's configured upstream
+    # (a middleman-issued token is rejected by api.anthropic.com), so a judge
+    # that reuses it must call the same host unless a policy/LLM_JUDGE_API_BASE
+    # override says otherwise.
     provider = DirectApiProvider(
         name=passthrough_name,
         credential=_PLACEHOLDER_CREDENTIAL,
         default_model=passthrough_default_model,
-        api_base=passthrough_api_base,
+        api_base=passthrough_api_base or get_settings().anthropic_base_url,
     )
     return DispatchResult(provider=provider, credential_override=context.user_credential)
 

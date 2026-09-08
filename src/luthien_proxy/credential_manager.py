@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CACHE_KEY_PREFIX = "luthien:auth:cred:"
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages/count_tokens"
+ANTHROPIC_VALIDATION_PATH = "/v1/messages/count_tokens"
 ANTHROPIC_API_VERSION = "2023-06-01"
 ANTHROPIC_BETA = "token-counting-2024-11-01"
 
@@ -93,6 +93,7 @@ class CredentialManager:
         db_pool: DatabasePool | None,
         cache: CredentialCacheProtocol | None,
         encryption_key: bytes | None = None,
+        anthropic_base_url: str = "https://api.anthropic.com",
     ):
         """Initialize with DB pool for config and credential cache.
 
@@ -100,8 +101,12 @@ class CredentialManager:
             db_pool: Database pool for auth config and server credentials.
             cache: Credential validation cache (Redis or in-process).
             encryption_key: Optional Fernet key for encrypting stored credentials.
+            anthropic_base_url: Upstream that validates credentials; must be the same
+                upstream requests are forwarded to, or a gateway-issued token is judged
+                by the wrong server.
         """
         self._db_pool = db_pool
+        self._validation_url = f"{anthropic_base_url.rstrip('/')}{ANTHROPIC_VALIDATION_PATH}"
         self._cache = cache
         self._config = AuthConfig(
             auth_mode=AuthMode.BOTH,
@@ -367,7 +372,7 @@ class CredentialManager:
 
         try:
             response = await self._http_client.post(
-                ANTHROPIC_API_URL,
+                self._validation_url,
                 headers=headers,
                 json=VALIDATION_PAYLOAD,
             )

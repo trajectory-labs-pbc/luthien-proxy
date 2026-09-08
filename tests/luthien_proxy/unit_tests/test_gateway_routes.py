@@ -12,6 +12,17 @@ from luthien_proxy.credential_manager import AuthConfig, AuthMode, CredentialMan
 from luthien_proxy.llm.anthropic_client import AnthropicClient
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_anthropic_base_url(monkeypatch):
+    """Pin the upstream to the default: ANTHROPIC_BASE_URL is the SDK's own variable and is often exported in a developer shell."""
+    from luthien_proxy.settings import clear_settings_cache
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    clear_settings_cache()
+    yield
+    clear_settings_cache()
+
+
 class TestAnthropicClientWithApiKey:
     """Test AnthropicClient.with_api_key() method."""
 
@@ -240,7 +251,9 @@ class TestGatewayAuthAndClientResolution:
                     "x-anthropic-api-key": "sk-ant-client-key-123",
                 },
             )
-            mock_cache.get_client.assert_called_once_with("sk-ant-client-key-123", auth_type="api_key", base_url=None)
+            mock_cache.get_client.assert_called_once_with(
+                "sk-ant-client-key-123", auth_type="api_key", base_url="https://api.anthropic.com"
+            )
 
     def test_empty_x_anthropic_api_key_returns_401(self, mock_app):
         app, _, credential_manager, _ = mock_app
@@ -285,7 +298,9 @@ class TestGatewayAuthAndClientResolution:
             )
             assert response.status_code == 200
             credential_manager.validate_credential.assert_not_called()
-            mock_cache.get_client.assert_called_once_with("some-anthropic-token", auth_type="auth_token", base_url=None)
+            mock_cache.get_client.assert_called_once_with(
+                "some-anthropic-token", auth_type="auth_token", base_url="https://api.anthropic.com"
+            )
 
     def test_passthrough_bearer_creates_auth_token_client(self, mock_app):
         """In passthrough mode, a Bearer credential creates an auth_token client."""
@@ -308,7 +323,9 @@ class TestGatewayAuthAndClientResolution:
                 },
                 headers={"Authorization": "Bearer my-anthropic-token"},
             )
-            mock_cache.get_client.assert_called_once_with("my-anthropic-token", auth_type="auth_token", base_url=None)
+            mock_cache.get_client.assert_called_once_with(
+                "my-anthropic-token", auth_type="auth_token", base_url="https://api.anthropic.com"
+            )
 
     def test_passthrough_bearer_with_api_key_prefix_creates_auth_token_client(self, mock_app):
         """In passthrough mode, Bearer transport is authoritative — even if the token
@@ -333,7 +350,7 @@ class TestGatewayAuthAndClientResolution:
                 headers={"Authorization": "Bearer sk-ant-api03-test-key"},
             )
             mock_cache.get_client.assert_called_once_with(
-                "sk-ant-api03-test-key", auth_type="auth_token", base_url=None
+                "sk-ant-api03-test-key", auth_type="auth_token", base_url="https://api.anthropic.com"
             )
 
     def test_passthrough_api_key_creates_api_key_client(self, mock_app):
@@ -357,7 +374,9 @@ class TestGatewayAuthAndClientResolution:
                 },
                 headers={"x-api-key": "sk-ant-my-key"},
             )
-            mock_cache.get_client.assert_called_once_with("sk-ant-my-key", auth_type="api_key", base_url=None)
+            mock_cache.get_client.assert_called_once_with(
+                "sk-ant-my-key", auth_type="api_key", base_url="https://api.anthropic.com"
+            )
 
     def test_no_anthropic_client_returns_500_for_client_key(self, mock_app):
         """Proxy key auth with no ANTHROPIC_API_KEY configured returns 500."""
@@ -691,3 +710,110 @@ class TestRateLimitingRouteIntegration:
 
             response2 = client.get("/v1/models", headers=headers)
             assert response2.status_code == 429
+
+
+class TestAnthropicUpstreamIsConfigurable:
+    """ANTHROPIC_BASE_URL decides where every Anthropic-bound request goes.
+
+    A bearer token issued by an upstream gateway (hawk middleman) is only valid
+    at that gateway, so the passthrough client, the raw /v1/* proxy, and the
+    judge's user-credential provider must all follow the configured base rather
+    than the SDK default.
+    """
+
+    GATEWAY = "https://middleman.example.test/anthropic"
+
+    @pytest.fixture
+    def gateway_settings(self, monkeypatch):
+        from luthien_proxy.settings import clear_settings_cache
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", self.GATEWAY)
+        clear_settings_cache()
+        yield
+        clear_settings_cache()
+
+    @pytest.fixture
+    def mock_app(self):
+        return TestGatewayAuthAndClientResolution.mock_app.__wrapped__(self)
+
+    def test_passthrough_client_without_server_key_targets_configured_base(self, gateway_settings, mock_app):
+        app, _, credential_manager, deps = mock_app
+        deps.anthropic_client = None  # no server key configured: passthrough must still target the gateway
+        credential_manager.config = replace(
+            credential_manager.config, auth_mode=AuthMode.PASSTHROUGH, validate_credentials=False
+        )
+        with (
+            patch("luthien_proxy.gateway_routes.process_anthropic_request", new_callable=AsyncMock) as mock_process,
+            patch("luthien_proxy.gateway_routes.anthropic_client_cache") as mock_cache,
+        ):
+            mock_cache.get_client = AsyncMock(return_value=MagicMock())
+            mock_process.return_value = MagicMock()
+            TestClient(app).post(
+                "/v1/messages",
+                json={"model": DEFAULT_TEST_MODEL, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 10},
+                headers={"Authorization": "Bearer hawk-issued-jwt"},
+            )
+            mock_cache.get_client.assert_called_once_with(
+                "hawk-issued-jwt", auth_type="auth_token", base_url=self.GATEWAY
+            )
+
+    def test_raw_v1_passthrough_targets_configured_base(self, gateway_settings, mock_app):
+        app, _, credential_manager, deps = mock_app
+        deps.api_key = None
+        credential_manager.config = replace(
+            credential_manager.config, auth_mode=AuthMode.PASSTHROUGH, validate_credentials=False
+        )
+        upstream = MagicMock(status_code=200, content=b"{}", headers={"content-type": "application/json"})
+        with patch("luthien_proxy.gateway_routes._passthrough_client") as mock_http:
+            mock_http.request = AsyncMock(return_value=upstream)
+            TestClient(app).get("/v1/models", headers={"Authorization": "Bearer hawk-issued-jwt"})
+            assert mock_http.request.call_args.kwargs["url"] == f"{self.GATEWAY}/v1/models"
+
+    def test_judge_user_credential_provider_targets_configured_base(self, gateway_settings):
+        from luthien_proxy.credentials import Credential, CredentialType
+        from luthien_proxy.inference.dispatch import _passthrough
+
+        context = MagicMock()
+        context.user_credential = Credential(
+            value="hawk-issued-jwt", credential_type=CredentialType.AUTH_TOKEN, platform="anthropic"
+        )
+        result = _passthrough(
+            context, passthrough_default_model=DEFAULT_TEST_MODEL, passthrough_api_base=None, passthrough_name="judge"
+        )
+        assert result.provider._api_base == self.GATEWAY
+
+    def test_judge_explicit_api_base_still_wins(self, gateway_settings):
+        from luthien_proxy.credentials import Credential, CredentialType
+        from luthien_proxy.inference.dispatch import _passthrough
+
+        context = MagicMock()
+        context.user_credential = Credential(value="k", credential_type=CredentialType.API_KEY, platform="anthropic")
+        result = _passthrough(
+            context,
+            passthrough_default_model=DEFAULT_TEST_MODEL,
+            passthrough_api_base="https://judge.example.test",
+            passthrough_name="judge",
+        )
+        assert result.provider._api_base == "https://judge.example.test"
+
+    def test_default_base_is_anthropic(self):
+        from luthien_proxy.settings import get_settings
+
+        assert get_settings().anthropic_base_url == "https://api.anthropic.com"
+
+
+class TestAnthropicBaseUrlValidation:
+    @pytest.mark.parametrize("bad", ["", "api.anthropic.com", "https://", "ftp://x.example", "/v1"])
+    def test_rejects_unusable_values(self, bad):
+        from luthien_proxy.utils.url import validate_anthropic_base_url
+
+        with pytest.raises(ValueError, match="ANTHROPIC_BASE_URL"):
+            validate_anthropic_base_url(bad)
+
+    @pytest.mark.parametrize(
+        "good", ["https://api.anthropic.com", "http://127.0.0.1:18888", "https://middleman.example.test/anthropic/"]
+    )
+    def test_accepts_absolute_http_urls(self, good):
+        from luthien_proxy.utils.url import validate_anthropic_base_url
+
+        validate_anthropic_base_url(good)

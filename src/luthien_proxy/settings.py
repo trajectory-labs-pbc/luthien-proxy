@@ -72,6 +72,7 @@ class Settings(_SettingsBase):
 
     # ── llm ─────────────────────────────────────────────────────────
     anthropic_api_key: str | None = None
+    anthropic_base_url: str = "https://api.anthropic.com"
     llm_judge_model: str | None = None
     llm_judge_api_base: str | None = None
     anthropic_client_cache_size: int = 16

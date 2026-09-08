@@ -34,6 +34,7 @@ from luthien_proxy.policy_core.anthropic_execution_interface import (
     AnthropicExecutionInterface,
 )
 from luthien_proxy.rate_limit import TokenBucketRateLimiter
+from luthien_proxy.settings import get_settings
 from luthien_proxy.usage_telemetry.collector import UsageCollector
 from luthien_proxy.utils import db
 from luthien_proxy.webhook.sender import WebhookSender
@@ -41,8 +42,6 @@ from luthien_proxy.webhook.sender import WebhookSender
 router = APIRouter(tags=["gateway"])
 security = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
-
-ANTHROPIC_API_BASE = "https://api.anthropic.com"
 
 # Shared httpx client for the passthrough proxy.  Reusing a single client
 # avoids creating and tearing down a connection pool on every request.
@@ -128,7 +127,10 @@ async def resolve_anthropic_client(
     token = credential.value
     is_bearer = credential.credential_type == CredentialType.AUTH_TOKEN
     auth_mode = credential_manager.config.auth_mode if credential_manager else AuthMode.CLIENT_KEY
-    base_url = base_client._base_url if base_client else None
+    # Every passthrough client goes to the configured upstream, not the SDK
+    # default: a bearer token issued by a gateway (hawk middleman) is only valid
+    # there, so falling back to api.anthropic.com would reject it.
+    base_url = get_settings().anthropic_base_url
 
     async def _record_credential_type(cred_type: str) -> None:
         """Best-effort write of observed credential type for /api/admin/billing-status visibility."""
@@ -272,7 +274,7 @@ async def proxy_passthrough(
     like /v1/messages/count_tokens, /v1/models, etc. without getting 404.
     """
     # Build upstream URL
-    upstream_url = f"{ANTHROPIC_API_BASE}/v1/{path}"
+    upstream_url = f"{get_settings().anthropic_base_url.rstrip('/')}/v1/{path}"
 
     # Forward relevant headers (auth, content-type, anthropic-specific)
     forward_headers: dict[str, str] = {}

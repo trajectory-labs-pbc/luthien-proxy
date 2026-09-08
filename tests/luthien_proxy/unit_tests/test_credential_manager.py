@@ -478,3 +478,28 @@ class TestUpdateConfig:
         manager = CredentialManager(db_pool=None, cache=None)
         with pytest.raises(ValueError):
             await manager.update_config(auth_mode="proxy_key")
+
+
+class TestValidationUpstreamIsConfigurable:
+    """Credential validation must hit the same upstream requests are forwarded to."""
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_posts_to_configured_base(self):
+        manager = CredentialManager(
+            db_pool=None, cache=None, anthropic_base_url="https://middleman.example.test/anthropic/"
+        )
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=MagicMock(status_code=200))
+        manager._http_client = mock_client
+        assert await manager._call_count_tokens("hawk-issued-jwt", is_bearer=True) is True
+        assert mock_client.post.call_args.args[0] == "https://middleman.example.test/anthropic/v1/messages/count_tokens"
+
+    @pytest.mark.asyncio
+    async def test_default_validation_upstream_is_anthropic(self):
+        # Constructor default, independent of the process env: main.py passes the setting explicitly.
+        manager = CredentialManager(db_pool=None, cache=None)
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=MagicMock(status_code=200))
+        manager._http_client = mock_client
+        await manager._call_count_tokens("sk-ant-key", is_bearer=False)
+        assert mock_client.post.call_args.args[0] == "https://api.anthropic.com/v1/messages/count_tokens"

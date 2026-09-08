@@ -67,7 +67,7 @@ from luthien_proxy.utils.credential_cache import (
     RedisCredentialCache,
 )
 from luthien_proxy.utils.migration_check import check_migrations
-from luthien_proxy.utils.url import sanitize_url_for_logging
+from luthien_proxy.utils.url import sanitize_url_for_logging, validate_anthropic_base_url
 from luthien_proxy.version import PROXY_DISPLAY_VERSION
 from luthien_proxy.webhook.sender import WebhookSender
 
@@ -196,6 +196,7 @@ def create_app(
         # Fail fast on UPSTREAM_HEADERS misconfiguration rather than silently
         # disabling the integration on first request.
         validate_upstream_headers_at_startup()
+        validate_anthropic_base_url(settings.anthropic_base_url)
 
         # Create event publisher (Redis or in-process)
         _event_publisher: EventPublisherProtocol
@@ -231,7 +232,7 @@ def create_app(
         _anthropic_client: AnthropicClient | None = None
         anthropic_api_key = settings.anthropic_api_key
         if anthropic_api_key:
-            _anthropic_client = AnthropicClient(api_key=anthropic_api_key)
+            _anthropic_client = AnthropicClient(api_key=anthropic_api_key, base_url=settings.anthropic_base_url)
 
         # Create credential cache (Redis or in-process)
         _credential_cache: CredentialCacheProtocol | None
@@ -244,7 +245,12 @@ def create_app(
         # Initialize CredentialManager for passthrough auth + server credentials
         _enc_key_str = get_settings().credential_encryption_key
         encryption_key = _enc_key_str.encode() if _enc_key_str else None
-        _credential_manager = CredentialManager(db_pool=db_pool, cache=_credential_cache, encryption_key=encryption_key)
+        _credential_manager = CredentialManager(
+            db_pool=db_pool,
+            cache=_credential_cache,
+            encryption_key=encryption_key,
+            anthropic_base_url=settings.anthropic_base_url,
+        )
         await _credential_manager.initialize(default_auth_mode=auth_mode)
 
         # Inference provider registry depends on the credential manager

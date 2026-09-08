@@ -171,6 +171,13 @@ CONFIG_FIELDS: tuple[ConfigFieldMeta, ...] = (
         sensitive=True, category="llm",
     ),
     ConfigFieldMeta(
+        "anthropic_base_url", "ANTHROPIC_BASE_URL", str, "https://api.anthropic.com",
+        "Upstream base URL for Anthropic traffic: proxied /v1/messages, the raw /v1/* passthrough, "
+        "credential validation, and judge calls made with the request's own credential. Same variable the "
+        "Anthropic SDK reads, so a mock or gateway upstream (e.g. hawk middleman) is configured once",
+        category="llm",
+    ),
+    ConfigFieldMeta(
         "llm_judge_model", "LLM_JUDGE_MODEL", str, None,
         "Model ID for the LLM judge policy",
         category="llm",

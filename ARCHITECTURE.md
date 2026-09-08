@@ -22,7 +22,7 @@ Client receives (possibly modified) response
 The gateway speaks the Anthropic Messages API natively:
 
 - **`POST /v1/messages`** — the native Anthropic path, handled by the policy pipeline. Preserves Anthropic-specific features (extended thinking, tool use, prompt caching).
-- **`/v1/{anything else}`** — transparent passthrough to `https://api.anthropic.com` so Claude Code endpoints like `/v1/messages/count_tokens` and `/v1/models` work without 404s. Passthrough requests authenticate the same way as `/v1/messages` but bypass the policy pipeline.
+- **`/v1/{anything else}`** — transparent passthrough to the configured `ANTHROPIC_BASE_URL` upstream (default `https://api.anthropic.com`) so Claude Code endpoints like `/v1/messages/count_tokens` and `/v1/models` work without 404s. Passthrough requests authenticate the same way as `/v1/messages` but bypass the policy pipeline.
 
 There is no OpenAI-format path. The gateway was simplified to Anthropic-only.
 
@@ -35,7 +35,7 @@ A `POST /v1/messages` request flows through four phases. The entry point is `pro
 `gateway_routes.py` receives the HTTP request and resolves three things in a linear dependency chain:
 
 1. `get_request_credential` — extracts a `Credential` from the `Authorization: Bearer` or `x-api-key` header.
-2. `verify_token` — validates the credential against the configured `AuthMode` (`client_key`, `passthrough`, or `both`). In passthrough/both modes, `CredentialManager.validate_credential()` checks Anthropic's free `count_tokens` endpoint, cached via Redis or an in-process cache.
+2. `verify_token` — validates the credential against the configured `AuthMode` (`client_key`, `passthrough`, or `both`). In passthrough/both modes, `CredentialManager.validate_credential()` checks the configured upstream's (`ANTHROPIC_BASE_URL`) free `count_tokens` endpoint, cached via Redis or an in-process cache.
 3. `resolve_anthropic_client` — builds an `AnthropicClient` from the credential. The `x-anthropic-api-key` header, if present, is used to forward a different key to the backend than the one that authenticated the client.
 
 ### 2. Process Request

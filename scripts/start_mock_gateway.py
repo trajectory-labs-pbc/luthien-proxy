@@ -24,6 +24,7 @@ os.environ.setdefault("ENABLE_REQUEST_LOGGING", "true")
 import uvicorn  # noqa: E402
 
 from luthien_proxy.main import create_app  # noqa: E402
+from luthien_proxy.settings import clear_settings_cache  # noqa: E402
 from luthien_proxy.utils.db import DatabasePool  # noqa: E402
 from luthien_proxy.utils.migration_check import check_migrations  # noqa: E402
 
@@ -74,6 +75,10 @@ def main():
 
     os.environ["ANTHROPIC_BASE_URL"] = f"http://localhost:{mock_port}"
     os.environ["ANTHROPIC_API_KEY"] = "mock-key"
+    # The gateway resolves its Anthropic upstream from settings, which were
+    # cached at import; re-read them now that the mock URL is in the env
+    # (same as tests/luthien_proxy/e2e_tests/sqlite/_boot.py).
+    clear_settings_cache()
 
     app = create_app(
         api_key=api_key,
