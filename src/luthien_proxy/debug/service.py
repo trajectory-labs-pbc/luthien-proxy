@@ -276,6 +276,7 @@ async def fetch_call_diff(call_id: str, db_pool: DatabasePool) -> CallDiffRespon
             SELECT call_id, event_type, payload
             FROM conversation_events
             WHERE call_id = $1 AND event_type IN (
+                'pipeline.client_request',
                 'transaction.request_recorded',
                 'transaction.non_streaming_response_recorded',
                 'transaction.streaming_response_recorded'
@@ -288,10 +289,20 @@ async def fetch_call_diff(call_id: str, db_pool: DatabasePool) -> CallDiffRespon
     if not rows:
         raise ValueError(f"No events found for call_id: {call_id}")
 
+    # Resolve the referenced raw body before constructing diffs. DB writes are
+    # asynchronous, so created_at ordering cannot be used as a dependency.
+    client_request: dict[str, Any] | None = None
+    for row in rows:
+        if str(row["event_type"]) != "pipeline.client_request":
+            continue
+        candidate = _parse_payload(row["payload"]).get("payload")
+        if isinstance(candidate, dict):
+            client_request = candidate
+            break
+
     # Parse events
     request_diff = None
     response_diff = None
-
     for row in rows:
         event_type = str(row["event_type"])
         payload = _parse_payload(row["payload"])
@@ -299,9 +310,11 @@ async def fetch_call_diff(call_id: str, db_pool: DatabasePool) -> CallDiffRespon
             continue
 
         if event_type == "transaction.request_recorded":
-            # payload has {original_request: {...}, final_request: {...}, ...}
-            original = payload.get("original_request", {})
-            final = payload.get("final_request", {})
+            # original_request is inline only when policy processing changed it.
+            original = payload.get("original_request")
+            if original is None and payload.get("original_request_event") == "pipeline.client_request":
+                original = client_request
+            final = payload.get("final_request")
             if isinstance(original, dict) and isinstance(final, dict):
                 request_diff = compute_request_diff(original, final)
 

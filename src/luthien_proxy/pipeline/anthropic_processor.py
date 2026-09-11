@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
-from typing import Literal, TypedDict, TypeGuard, cast
+from typing import Any, Literal, TypedDict, TypeGuard, cast
 
 from anthropic import APIConnectionError as AnthropicConnectionError
 from anthropic import APIStatusError as AnthropicStatusError
@@ -96,6 +97,11 @@ logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
 
+def _canonical_json_bytes(payload: AnthropicRequest) -> bytes:
+    """Serialize a request deterministically for payload metadata."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
 class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
     """Request-scoped I/O helpers for execution-oriented Anthropic policies."""
 
@@ -145,35 +151,56 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         """Replace the current request payload used by backend helper methods."""
         self._request = request
 
-    def ensure_request_recorded(self, final_request: AnthropicRequest | None = None) -> None:
+    def ensure_request_recorded(
+        self,
+        final_request: AnthropicRequest | None = None,
+        canonical_final_request: bytes | None = None,
+    ) -> None:
         """Record transaction.request_recorded once for this request lifecycle."""
         if self._request_recorded:
             return
 
         effective_request = final_request or self._request
+        transaction_payload: dict[str, Any] = {
+            "original_model": self._initial_request["model"],
+            "final_model": effective_request["model"],
+            "final_request": dict(effective_request),
+            "session_id": self._session_id,
+            "user_id": self._user_id,
+        }
+        if self._initial_request == effective_request:
+            original_request_bytes = (
+                canonical_final_request
+                if canonical_final_request is not None
+                else _canonical_json_bytes(self._initial_request)
+            )
+            transaction_payload["original_request_sha256"] = hashlib.sha256(original_request_bytes).hexdigest()
+            transaction_payload["original_request_event"] = "pipeline.client_request"
+        else:
+            transaction_payload["original_request"] = dict(self._initial_request)
+
         self._emitter.record(
             self._call_id,
             "transaction.request_recorded",
-            {
-                "original_model": self._initial_request["model"],
-                "final_model": effective_request["model"],
-                "original_request": dict(self._initial_request),
-                "final_request": dict(effective_request),
-                "session_id": self._session_id,
-                "user_id": self._user_id,
-            },
+            transaction_payload,
         )
         self._request_recorded = True
 
     def _record_backend_request(self, request: AnthropicRequest) -> None:
-        """Record backend request events."""
-        self.ensure_request_recorded(request)
-
+        """Record backend request metadata and preserve the full HTTP request log."""
+        canonical_request = _canonical_json_bytes(request)
+        self.ensure_request_recorded(request, canonical_final_request=canonical_request)
         request_payload = dict(request)
         self._emitter.record(
             self._call_id,
             "pipeline.backend_request",
-            {"payload": request_payload, "session_id": self._session_id, "user_id": self._user_id},
+            {
+                "session_id": self._session_id,
+                "user_id": self._user_id,
+                "model": request["model"],
+                "payload_sha256": hashlib.sha256(canonical_request).hexdigest(),
+                "payload_bytes": len(canonical_request),
+            },
         )
         self._request_log_recorder.record_outbound_request(
             body=request_payload,

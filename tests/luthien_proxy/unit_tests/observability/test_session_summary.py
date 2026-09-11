@@ -64,6 +64,17 @@ class TestExtractPreview:
     def test_extracts_first_user_message_string(self) -> None:
         assert extract_preview(_request(text="hi there")) == "hi there"
 
+    def test_uses_final_request_for_deduplicated_transaction(self) -> None:
+        data = {
+            "original_request_sha256": "a" * 64,
+            "original_request_event": "pipeline.client_request",
+            "final_request": {
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "deduplicated preview"}],
+            },
+        }
+        assert extract_preview(data) == "deduplicated preview"
+
     def test_extracts_from_content_blocks(self) -> None:
         data = {
             "final_request": {

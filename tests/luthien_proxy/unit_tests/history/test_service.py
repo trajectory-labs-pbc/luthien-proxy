@@ -177,6 +177,15 @@ class TestExtractPreviewMessage:
         payload = {"final_request": {"messages": [{"role": "user", "content": "Legacy payload"}]}}
         assert _extract_preview_message(payload) == "Legacy payload"
 
+    def test_deduplicated_transaction_uses_final_request_for_preview(self):
+        """A transaction reference still produces a preview from its canonical final body."""
+        payload = {
+            "original_request_sha256": "a" * 64,
+            "original_request_event": "pipeline.client_request",
+            "final_request": {"messages": [{"role": "user", "content": "Deduplicated payload"}]},
+        }
+        assert _extract_preview_message(payload) == "Deduplicated payload"
+
     @pytest.mark.parametrize(
         "probe_content",
         ["count", "quota", "ping", "any-future-probe"],
@@ -802,6 +811,30 @@ class TestBuildTurn:
         assert len(turn.request_messages) == 1
         assert len(turn.response_messages) == 1
         assert not turn.had_policy_intervention
+
+    def test_deduplicated_transaction_uses_final_request_for_turn(self):
+        """Session detail keeps the request body when original_request is a client-event reference."""
+        events = [
+            {
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "final_model": DEFAULT_TEST_MODEL,
+                    "original_request_sha256": "a" * 64,
+                    "original_request_event": "pipeline.client_request",
+                    "final_request": {
+                        "model": DEFAULT_TEST_MODEL,
+                        "messages": [{"role": "user", "content": "Deduplicated payload"}],
+                    },
+                },
+                "created_at": datetime(2025, 1, 15, 10, 0, 0),
+            }
+        ]
+
+        turn = _build_turn("call-123", events)
+
+        assert turn.request_messages[0].content == "Deduplicated payload"
+        assert turn.original_request_messages is None
+        assert not turn.request_was_modified
 
     def test_request_params_allowlist(self):
         """Test that request_params only includes allowlisted fields."""

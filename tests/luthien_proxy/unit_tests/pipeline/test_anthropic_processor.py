@@ -1,6 +1,7 @@
 """Unit tests for the Anthropic-native pipeline processor module."""
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -674,16 +675,97 @@ class TestProcessAnthropicRequest:
         # Verify transaction.request_recorded was emitted
         event_types = [call[0][1] for call in mock_emitter.record.call_args_list]
         assert "transaction.request_recorded" in event_types
-
-        # Verify payload structure
+        # Verify deduplicated transaction payload structure.
         for call in mock_emitter.record.call_args_list:
             if call[0][1] == "transaction.request_recorded":
                 payload = call[0][2]
+                canonical_body = json.dumps(anthropic_body, sort_keys=True, separators=(",", ":")).encode()
                 assert payload["final_model"] == DEFAULT_TEST_MODEL
-                assert "original_request" in payload
-                assert "final_request" in payload
                 assert payload["final_request"]["messages"][0]["content"] == "Hello"
+                assert "original_request" not in payload
+                assert payload["original_request_sha256"] == hashlib.sha256(canonical_body).hexdigest()
+                assert payload["original_request_event"] == "pipeline.client_request"
                 break
+
+    @pytest.mark.asyncio
+    async def test_unchanged_request_body_is_stored_only_by_client_and_transaction_events(
+        self, mock_request, mock_policy, mock_anthropic_client, mock_emitter
+    ):
+        """The backend event records metadata rather than a third request-body copy."""
+        anthropic_body: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "messages": [{"role": "user", "content": "x" * 127_000}],
+            "max_tokens": 1024,
+            "stream": False,
+        }
+        mock_request.json = AsyncMock(return_value=anthropic_body)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer:
+            mock_span = MagicMock()
+            mock_tracer.start_as_current_span.return_value.__enter__ = MagicMock(return_value=mock_span)
+            mock_tracer.start_as_current_span.return_value.__exit__ = MagicMock(return_value=False)
+
+            await process_anthropic_request(
+                request=mock_request,
+                policy=mock_policy,
+                anthropic_client=mock_anthropic_client,
+                emitter=mock_emitter,
+            )
+
+        events = {call.args[1]: call.args[2] for call in mock_emitter.record.call_args_list}
+        canonical_body = json.dumps(anthropic_body, sort_keys=True, separators=(",", ":")).encode()
+        backend_request = events["pipeline.backend_request"]
+        transaction_request = events["transaction.request_recorded"]
+
+        assert "payload" not in backend_request
+        assert backend_request["payload_sha256"] == hashlib.sha256(canonical_body).hexdigest()
+        assert backend_request["payload_bytes"] == len(canonical_body)
+        assert transaction_request["final_request"] == anthropic_body
+        assert "original_request" not in transaction_request
+        assert transaction_request["original_request_sha256"] == hashlib.sha256(canonical_body).hexdigest()
+        assert transaction_request["original_request_event"] == "pipeline.client_request"
+        assert len(json.dumps(backend_request, sort_keys=True, separators=(",", ":"))) < len(canonical_body)
+
+    @pytest.mark.asyncio
+    async def test_rewritten_request_keeps_original_body_inline(
+        self, mock_request, mock_anthropic_client, mock_emitter
+    ):
+        """A policy rewrite retains the original body for the history diff."""
+
+        class RewritingPolicy(NoOpPolicy):
+            async def on_anthropic_request(self, request: AnthropicRequest, context: PolicyContext) -> AnthropicRequest:
+                return {
+                    **request,
+                    "messages": [{"role": "user", "content": "Rewritten"}],
+                }
+
+        anthropic_body: AnthropicRequest = {
+            "model": DEFAULT_TEST_MODEL,
+            "messages": [{"role": "user", "content": "Original"}],
+            "max_tokens": 1024,
+            "stream": False,
+        }
+        mock_request.json = AsyncMock(return_value=anthropic_body)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tracer") as mock_tracer:
+            mock_span = MagicMock()
+            mock_tracer.start_as_current_span.return_value.__enter__ = MagicMock(return_value=mock_span)
+            mock_tracer.start_as_current_span.return_value.__exit__ = MagicMock(return_value=False)
+
+            await process_anthropic_request(
+                request=mock_request,
+                policy=RewritingPolicy(),
+                anthropic_client=mock_anthropic_client,
+                emitter=mock_emitter,
+            )
+
+        events = {call.args[1]: call.args[2] for call in mock_emitter.record.call_args_list}
+        transaction_request = events["transaction.request_recorded"]
+
+        assert transaction_request["original_request"] == anthropic_body
+        assert transaction_request["final_request"]["messages"][0]["content"] == "Rewritten"
+        assert "original_request_sha256" not in transaction_request
+        assert "original_request_event" not in transaction_request
 
     @pytest.mark.asyncio
     async def test_streaming_request_returns_streaming_response(self, mock_request, mock_policy, mock_emitter):

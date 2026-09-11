@@ -301,11 +301,10 @@ _SYSTEM_REMINDER_PATTERN = re.compile(r"<system-reminder>.*?</system-reminder>\s
 def _extract_preview_message(payload: dict[str, Any] | str | None) -> str | None:
     """Extract the first meaningful user message from a request payload for preview.
 
-    Used to generate a session preview/title. Returns truncated text.
-    Reads from ``original_request`` so the preview reflects what the user typed,
-    not gateway-injected content (e.g. ``<policy-context>`` from
-    ``inject_policy_awareness_anthropic``). Falls back to ``final_request`` for
-    older payloads recorded before ``original_request`` was stored.
+    Used to generate a session preview/title. Policy-rewritten requests retain
+    ``original_request`` inline so the preview reflects user input. Unchanged
+    requests reference ``pipeline.client_request`` and use the identical
+    canonical ``final_request`` body.
     """
     if not payload:
         return None

@@ -379,4 +379,28 @@ covered by the except clause (asyncpg errors + `sqlite3.Error`).
 
 ---
 
+## Request body event storage (2026-09-11)
+
+**Decision**: Keep one raw request body in `pipeline.client_request.payload`
+and one final request body in `transaction.request_recorded.final_request`.
+`pipeline.backend_request` records only the final request's model, canonical
+JSON SHA-256, and byte count. When policy processing leaves the request
+unchanged, the transaction records the raw body's SHA-256 and its
+`pipeline.client_request` reference instead of a second `original_request`;
+when policy processing changes it, the original remains inline for the history
+and debug diffs.
+
+**Rationale**: A 127 KB request body was previously written four times:
+`pipeline.client_request`, `pipeline.backend_request`, and the original and
+final copies in `transaction.request_recorded`, for about 508 KB per request.
+The raw event remains the audit record for what the client sent, and the final
+transaction body remains the history reader's canonical request. The metadata
+event keeps backend payload identity observable without another body copy.
+
+**Scope**: HTTP request logging continues to store inbound and outbound request
+bodies when `ENABLE_REQUEST_LOGGING` is enabled. It is a separately gated,
+low-volume diagnostic surface and is outside this event-storage contract.
+
+---
+
 (Add new decisions as they're made with timestamps: YYYY-MM-DD)

@@ -282,7 +282,7 @@ def test_find_free_port_skips_excluded():
 
 
 def test_find_docker_ports_respects_env_vars():
-    with patch.dict("os.environ", {"GATEWAY_PORT": "9999"}):
+    with patch.dict("os.environ", {"GATEWAY_PORT": "9999"}, clear=True):
         with patch("luthien_cli.local_process.find_free_port", return_value=5433):
             result = _find_docker_ports()
             assert "GATEWAY_PORT" not in result

@@ -13,6 +13,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 
@@ -35,6 +36,7 @@ _REPLACEMENTS = [["Anthropic", "ACME"], ["models", "widgets"]]
 _RESPONSE_MODIFIED_EVENT = "policy.string_replacement.response_modified"
 _REQUEST_MODIFIED_EVENT = "policy.string_replacement.request_modified"
 _TRANSACTION_RECORDED_EVENT = "transaction.request_recorded"
+_BACKEND_REQUEST_EVENT = "pipeline.backend_request"
 
 
 async def _poll_for_event(
@@ -107,6 +109,72 @@ async def test_response_modified_event_emitted_for_non_streaming(
     assert payload["total_replacements"] == 2  # Anthropic + models
     assert payload["original_length"] == len("Anthropic makes great models")
     assert payload["transformed_length"] == len("ACME makes great widgets")
+
+
+@pytest.mark.asyncio
+async def test_unchanged_request_emits_deduplicated_body_metadata(
+    mock_anthropic: MockAnthropicServer,
+    gateway_healthy,
+    gateway_url: str,
+    auth_headers: dict,
+    admin_headers: dict,
+    admin_api_key: str,
+):
+    """A real gateway request retains bodies only in client and transaction events."""
+    request_body = {**_BASE_REQUEST, "stream": False}
+    mock_anthropic.enqueue(text_response("ok"))
+
+    async with policy_context(
+        "luthien_proxy.policies.noop_policy:NoOpPolicy",
+        {},
+        gateway_url=gateway_url,
+        admin_api_key=admin_api_key,
+    ):
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{gateway_url}/v1/messages",
+                json=request_body,
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+            call_id = response.headers.get("x-call-id")
+            assert call_id, "No X-Call-ID header on response"
+            transaction_event = await _poll_for_event(
+                client,
+                call_id,
+                _TRANSACTION_RECORDED_EVENT,
+                gateway_url=gateway_url,
+                admin_headers=admin_headers,
+            )
+            backend_event = await _poll_for_event(
+                client,
+                call_id,
+                _BACKEND_REQUEST_EVENT,
+                gateway_url=gateway_url,
+                admin_headers=admin_headers,
+            )
+            diff_response = await client.get(
+                f"{gateway_url}/api/debug/calls/{call_id}/diff",
+                headers=admin_headers,
+            )
+            assert diff_response.status_code == 200
+            request_diff = diff_response.json()["request"]
+
+    assert request_diff["messages"][0]["original_content"] == "hello"
+    assert request_diff["messages"][0]["final_content"] == "hello"
+
+    canonical_body = json.dumps(request_body, sort_keys=True, separators=(",", ":")).encode()
+    transaction_payload = transaction_event["payload"]
+    backend_payload = backend_event["payload"]
+
+    assert transaction_payload["final_request"] == request_body
+    assert "original_request" not in transaction_payload
+    assert transaction_payload["original_request_sha256"] == hashlib.sha256(canonical_body).hexdigest()
+    assert transaction_payload["original_request_event"] == "pipeline.client_request"
+    assert "payload" not in backend_payload
+    assert backend_payload["model"] == request_body["model"]
+    assert backend_payload["payload_sha256"] == hashlib.sha256(canonical_body).hexdigest()
+    assert backend_payload["payload_bytes"] == len(canonical_body)
 
 
 @pytest.mark.asyncio

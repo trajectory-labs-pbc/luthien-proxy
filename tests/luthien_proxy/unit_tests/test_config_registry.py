@@ -39,7 +39,8 @@ def _make_registry(
 
 
 class TestResolveDefaults:
-    def test_default_value_when_no_overrides(self):
+    def test_default_value_when_no_overrides(self, monkeypatch):
+        monkeypatch.delenv("GATEWAY_PORT", raising=False)
         registry = _make_registry()
         registry._resolve_all()
         resolved = registry.get_resolved("gateway_port")
@@ -94,7 +95,8 @@ class TestResolvePriority:
         assert resolved.value is True
         assert resolved.source == ConfigSource.DB
 
-    def test_db_ignored_for_non_db_settable(self):
+    def test_db_ignored_for_non_db_settable(self, monkeypatch):
+        monkeypatch.delenv("GATEWAY_PORT", raising=False)
         registry = _make_registry()
         registry._db_values = {"gateway_port": "9999"}
         registry._resolve_all()

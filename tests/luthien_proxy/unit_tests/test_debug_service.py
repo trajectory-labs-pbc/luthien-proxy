@@ -311,6 +311,46 @@ class TestFetchCallDiff:
         assert result.request.model_changed
         assert result.tempo_trace_url is not None
 
+    @pytest.mark.asyncio
+    async def test_resolves_deduplicated_original_request_from_client_event(self):
+        """The request diff follows original_request_event when the body is deduplicated."""
+        mock_rows = [
+            {
+                "call_id": "test-call-id",
+                "event_type": "transaction.request_recorded",
+                "payload": {
+                    "original_request_sha256": "a" * 64,
+                    "original_request_event": "pipeline.client_request",
+                    "final_request": {
+                        "model": "claude-3-5-sonnet-20241022",
+                        "max_tokens": 1024,
+                        "messages": [{"role": "user", "content": "Rewritten"}],
+                    },
+                },
+            },
+            {
+                "call_id": "test-call-id",
+                "event_type": "pipeline.client_request",
+                "payload": {
+                    "payload": {
+                        "model": "claude-3-5-sonnet-20241022",
+                        "max_tokens": 1024,
+                        "messages": [{"role": "user", "content": "Original"}],
+                    }
+                },
+            },
+        ]
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = mock_rows
+        mock_pool = MagicMock()
+        mock_pool.connection.return_value.__aenter__.return_value = mock_conn
+
+        result = await fetch_call_diff("test-call-id", mock_pool)
+
+        assert result.request is not None
+        assert result.request.messages[0].original_content == "Original"
+        assert result.request.messages[0].final_content == "Rewritten"
+
     @pytest.mark.parametrize(
         "response_event_type",
         ["transaction.non_streaming_response_recorded", "transaction.streaming_response_recorded"],
