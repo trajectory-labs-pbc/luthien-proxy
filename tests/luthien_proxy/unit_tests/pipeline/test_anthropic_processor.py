@@ -3334,6 +3334,59 @@ class TestPassthroughFallback:
         assert len(self._fallback_events(emitter)) == 1
 
     @pytest.mark.asyncio
+    async def test_fallback_tags_the_resent_original_as_unmodified(self):
+        """Sentry provenance at each upstream call describes the request sent then.
+
+        The policy-modified attempt is tagged modified, so its 400 is reported.
+        The resent original is the client's own request, so a 400/404 on the
+        retry is classified like direct API access and dropped (see
+        observability/sentry.py:_CONTENT_DEPENDENT_STATUS_CODES).
+        """
+        tag_at_call: list[bool | None] = []
+        current_tag: dict[str, bool | None] = {"value": None}
+
+        def _record_tag(value: bool) -> None:
+            current_tag["value"] = value
+
+        async def _complete(request, extra_headers=None):
+            tag_at_call.append(current_tag["value"])
+            raise _status_error(400)
+
+        io, client, _ = self._make_io(enabled=True)
+        client.complete = AsyncMock(side_effect=_complete)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance", side_effect=_record_tag):
+            with pytest.raises(AnthropicStatusError):
+                await io.complete(self._modified_request())
+
+        assert tag_at_call == [False, True]
+
+    @pytest.mark.asyncio
+    async def test_streaming_fallback_tags_the_resent_original_as_unmodified(self):
+        """Streaming variant: the connect-time retry carries the unmodified tag."""
+        tag_at_call: list[bool | None] = []
+        current_tag: dict[str, bool | None] = {"value": None}
+
+        def _record_tag(value: bool) -> None:
+            current_tag["value"] = value
+
+        async def failing_stream(request, extra_headers=None):
+            tag_at_call.append(current_tag["value"])
+            raise _status_error(400)
+            yield  # pragma: no cover — makes this an async generator
+
+        client = MagicMock()
+        client.stream = MagicMock(side_effect=[failing_stream(None), failing_stream(None)])
+        io, client, _ = self._make_io(enabled=True, is_streaming=True, client=client)
+
+        with patch("luthien_proxy.pipeline.anthropic_processor.tag_request_provenance", side_effect=_record_tag):
+            with pytest.raises(AnthropicStatusError):
+                async for _ in io.stream(self._modified_request()):
+                    pass
+
+        assert tag_at_call == [False, True]
+
+    @pytest.mark.asyncio
     async def test_streaming_mid_stream_error_never_falls_back(self):
         """Once events have flowed, re-sending would duplicate content for the
         policy/client. Mid-stream errors propagate (no mid-stream recovery)."""

@@ -305,7 +305,9 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
         - WARNING log + ``pipeline.passthrough_fallback`` event,
         - ``pipeline.backend_request`` / request log for the resent original,
         - ``transaction.request_recorded`` with ``final_request`` = the original
-          (what was actually sent) and a ``passthrough_fallback`` block.
+          (what was actually sent) and a ``passthrough_fallback`` block,
+        - Sentry provenance tags for the resent original, so an upstream error
+          on the retry is classified by the request that actually failed.
         """
         logger.warning(
             "[%s] Policy-modified request rejected upstream (%s: %s); falling back to the original unmodified request",
@@ -330,6 +332,7 @@ class _AnthropicPolicyIO(AnthropicPolicyIOProtocol):
             "rejected_request": dict(rejected_request),
         }
         self._record_backend_request(fallback_request)
+        self._tag_request_provenance(fallback_request)
 
     async def complete(self, request: AnthropicRequest | None = None) -> AnthropicResponse:
         """Execute a non-streaming backend request."""
