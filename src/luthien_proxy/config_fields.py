@@ -207,8 +207,8 @@ CONFIG_FIELDS: tuple[ConfigFieldMeta, ...] = (
     ConfigFieldMeta(
         "observability_stdout_enabled", "OBSERVABILITY_STDOUT_ENABLED", bool, True,
         "Print full observability event payloads (incl. request/response bodies) to stdout as "
-        "JSON. Handy for local dev; disable in production to avoid large CloudWatch log-ingestion "
-        "cost (events are still persisted to the DB and the event publisher).",
+        "JSON. Handy for local dev; turn it off where stdout is shipped to central or paid log "
+        "storage (events are still persisted to the DB and the event publisher).",
         category="observability",
     ),
     ConfigFieldMeta(
