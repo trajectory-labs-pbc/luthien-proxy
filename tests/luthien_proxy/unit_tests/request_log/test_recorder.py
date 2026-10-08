@@ -597,6 +597,25 @@ class TestRequestLogRecorder:
         assert RequestLogRecorder.dropped_writes == before + 1
 
     @pytest.mark.asyncio
+    async def test_write_logs_counts_unserializable_body_as_dropped_write(self) -> None:
+        """A body json.dumps rejects is a dropped write, not an exception out of _write_logs()."""
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock()
+
+        db_pool = MagicMock(spec=DatabasePool)
+        db_pool.connection = MagicMock()
+        db_pool.connection.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        db_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        recorder = RequestLogRecorder(db_pool, "txn-123")
+        recorder.record_inbound_request(method="POST", url="http://example.com", headers={}, body={"raw": b"x"})
+
+        before = RequestLogRecorder.dropped_writes
+        await recorder._write_logs()
+        assert RequestLogRecorder.dropped_writes == before + 1
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_write_logs_context_manager_cleanup(self) -> None:
         """_write_logs() properly uses connection context manager for cleanup."""
         mock_conn = AsyncMock()
@@ -667,7 +686,12 @@ class TestRequestLogRecorder:
         await recorder._write_logs()
 
         spans = {span.name: span for span in span_exporter.get_finished_spans()}
-        assert spans["request_log.write"].status.status_code == StatusCode.ERROR
+        span = spans["request_log.write"]
+        assert span.status.status_code == StatusCode.ERROR
+        assert [event.name for event in span.events] == ["exception"]
+        event_attrs = span.events[0].attributes
+        assert event_attrs is not None
+        assert event_attrs["exception.type"] == "luthien_proxy.utils.db.DatabaseWriteError"
 
 
 class TestRequestLogRecorderIntegration:
@@ -950,6 +974,20 @@ class TestInsertLogRow:
         msg = str(exc_info.value)
         assert "inbound" in msg
         assert "txn-test" in msg
+
+    @pytest.mark.asyncio
+    async def test_serialization_error_raises_database_write_error(self) -> None:
+        """A body json.dumps rejects is wrapped in DatabaseWriteError, like a driver error."""
+        conn = AsyncMock()
+        conn.execute = AsyncMock()
+        pending = self._make_pending()
+        pending.request_body = {"raw": b"x"}
+
+        with pytest.raises(DatabaseWriteError) as exc_info:
+            await _insert_log_row(conn, pending, RequestLogRecorder._serialize_body)
+
+        assert isinstance(exc_info.value.cause, TypeError)
+        conn.execute.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_success_does_not_raise(self) -> None:

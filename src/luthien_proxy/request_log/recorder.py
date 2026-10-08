@@ -90,9 +90,9 @@ async def _insert_log_row(
     parameters) that breaks SQLite's ? placeholders. A None completed_at
     becomes NULL via to_timestamp(NULL) on both Postgres and SQLite.
     """
-    request_body = serialize_body(pending.request_body)
-    response_body = serialize_body(pending.response_body)
     try:
+        request_body = serialize_body(pending.request_body)
+        response_body = serialize_body(pending.response_body)
         await conn.execute(  # type: ignore[union-attr]
             """
             INSERT INTO request_logs (
