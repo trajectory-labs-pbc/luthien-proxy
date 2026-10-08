@@ -47,8 +47,9 @@ _LLM_CONTENT_VARS = {
 }
 
 # Upstream statuses that mean the request/response is the client's or the
-# provider's problem, not a proxy defect. The pipeline already converts every
-# one of these into a BackendAPIError response for the client (see
+# provider's problem rather than a change the proxy made on the way out. The
+# pipeline already converts every one of these into a BackendAPIError response
+# for the client (see
 # _handle_anthropic_error / _build_error_event, which log at warning and
 # handle every AnthropicStatusError the same way regardless of status code)
 # and, for the throttling/availability codes, the caller retries. They arrive
@@ -178,7 +179,7 @@ def _summarize(value: Any) -> Any:
 
 
 def _is_expected_upstream_error(exc: BaseException | None, tags: Mapping[str, object]) -> bool:
-    """True for provider errors that are the client's or provider's fault, not ours.
+    """True for provider errors on requests the proxy did not change, or throttling/availability errors.
 
     Matches on the SDK exception's own status_code rather than its class so a
     provider SDK renaming or adding a status subclass cannot silently start
