@@ -30,7 +30,6 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
 )
 from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -207,17 +206,17 @@ def instrument_redis() -> None:
 
 
 def instrument_db() -> None:
-    """Instrument the Postgres drivers with OpenTelemetry.
+    """Instrument asyncpg, the Postgres connection-pool driver, with OpenTelemetry.
 
-    Creates a span per database query for asyncpg (the primary connection-pool
-    driver) and psycopg, so slow queries surface in traces.
+    Creates a span per database query so slow queries surface in traces. The
+    instrumentor's spans carry the SQL statement text, the database name and
+    user, and the server host and port; query parameter values are not recorded.
     """
     if not get_settings().otel_enabled:
         return
 
     AsyncPGInstrumentor().instrument()
-    PsycopgInstrumentor().instrument()
-    logger.info("Postgres (asyncpg + psycopg) instrumented with OpenTelemetry")
+    logger.info("Postgres (asyncpg) instrumented with OpenTelemetry")
 
 
 def configure_logging() -> None:

@@ -157,7 +157,7 @@ class TestInstrumentRedis:
 
 
 class TestInstrumentDb:
-    """Test Postgres (asyncpg + psycopg) instrumentation."""
+    """Test Postgres (asyncpg) instrumentation."""
 
     def test_does_not_raise_exception(self):
         """instrument_db must not raise (no-op when OTEL is disabled)."""
