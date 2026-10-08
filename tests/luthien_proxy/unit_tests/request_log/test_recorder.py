@@ -23,19 +23,19 @@ import aiosqlite
 import asyncpg
 import pytest
 from opentelemetry import trace
-from opentelemetry.trace import StatusCode
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 from luthien_proxy.request_log import recorder as recorder_mod
 from luthien_proxy.request_log.recorder import (
     MAX_BODY_BYTES,
     NoOpRequestLogRecorder,
     RequestLogRecorder,
-    _SerializedBody,
     _insert_log_row,
     _PendingLog,
+    _SerializedBody,
     create_recorder,
 )
 from luthien_proxy.utils.db import DatabasePool, DatabaseWriteError
