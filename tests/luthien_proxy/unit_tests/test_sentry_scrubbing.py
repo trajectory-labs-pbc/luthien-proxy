@@ -197,8 +197,8 @@ class TestBeforeSend:
 
     def test_drops_upstream_rate_limit_error(self):
         """A 429 from Anthropic is the upstream telling us to slow down, not a proxy
-        bug. The SDK integration captures it unhandled at the call site, which burned
-        56 events in three days and buries real failures."""
+        bug. The SDK integration captures it unhandled at the call site, where it
+        uses Sentry quota and buries real failures."""
         exc = self._status_error(429)
         event = self._make_event()
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
@@ -209,9 +209,9 @@ class TestBeforeSend:
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
 
     def test_drops_upstream_bad_request_error(self):
-        """A 400 means the client sent content Anthropic rejects (e.g. an unsupported
+        """A 400 means Anthropic rejected the request's content (e.g. an unsupported
         field). Dropped only when the request carrying the PASSTHROUGH_TAG proves the
-        proxy relayed it unchanged — see LUTHIEN-6, 1,080 events for one recurring case."""
+        proxy relayed it unchanged."""
         exc = self._status_error(400)
         event = self._make_event(tags={PASSTHROUGH_TAG: True})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
@@ -228,7 +228,7 @@ class TestBeforeSend:
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is None
 
     def test_drops_upstream_not_found_error(self):
-        """A 404 means the client asked for a model Anthropic doesn't have (LUTHIEN-2),
+        """A 404 means the client asked for a model Anthropic doesn't have,
         and the PASSTHROUGH_TAG proves the proxy didn't rewrite the request."""
         exc = self._status_error(404)
         event = self._make_event(tags={PASSTHROUGH_TAG: True})
@@ -243,7 +243,7 @@ class TestBeforeSend:
 
     def test_drops_upstream_authentication_error(self):
         """A 401 means the credential passed through to Anthropic was invalid
-        (LUTHIEN-D) — the proxy correctly forwarded a bad token, it didn't mint
+        — the proxy correctly forwarded a bad token, it didn't mint
         one. Dropping requires BOTH PASSTHROUGH_TAG (request untouched) AND
         CREDENTIAL_PASSTHROUGH_TAG (the forwarded credential was the client's
         own, not the operator's shared key)."""
@@ -256,8 +256,8 @@ class TestBeforeSend:
         operator's shared credential forwarded instead of the client's own
         (CREDENTIAL_PASSTHROUGH_TAG False, client-key auth mode) must still
         report — the operator's credential is invalid, not the client's, and
-        dropping it would silently hide the outage. This is the deep-review
-        finding that PR #809's original PASSTHROUGH_TAG-only check missed."""
+        dropping it would silently hide the outage. PASSTHROUGH_TAG alone
+        cannot tell these two cases apart."""
         exc = self._status_error(401)
         event = self._make_event(tags={PASSTHROUGH_TAG: True, CREDENTIAL_PASSTHROUGH_TAG: False})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None
@@ -274,8 +274,7 @@ class TestBeforeSend:
         """A 400 where the request was NOT proven to be an unmodified client
         passthrough (PASSTHROUGH_TAG missing or False) must still report — a
         policy hook or header/context injection could have built the invalid
-        request that Anthropic rejected, and that's a proxy bug (thermonuclear
-        review finding: consensus High on PR #809)."""
+        request that Anthropic rejected, and that's a proxy bug."""
         exc = self._status_error(400)
         event = self._make_event(tags={PASSTHROUGH_TAG: False})
         assert _sentry_before_send(event, {"exc_info": (type(exc), exc, None)}) is not None

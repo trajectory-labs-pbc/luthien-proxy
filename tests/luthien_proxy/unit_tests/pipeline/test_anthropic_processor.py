@@ -688,7 +688,7 @@ class TestProcessAnthropicRequest:
     async def test_client_key_mode_tags_credential_passthrough_false_despite_unmodified_body(
         self, mock_request, mock_policy, mock_anthropic_client, mock_emitter
     ):
-        """Route-level regression for the PR #809 credential-provenance finding.
+        """Route-level check that client-key mode does not claim credential passthrough.
 
         In client-key auth mode, resolve_anthropic_client (gateway_routes.py)
         forwards the request with `user_credential=None` — the server's own
@@ -2331,15 +2331,13 @@ class TestAnthropicPolicyIOBuffering:
 class TestAnthropicPolicyIORequestProvenance:
     """Tests for _AnthropicPolicyIO tagging Sentry with request/credential provenance.
 
-    Covers PR #809 finding: 400/404 from Anthropic must only be treated as
-    "expected" (dropped from Sentry) when the request that reached Anthropic is
-    provably what the client sent — see observability/sentry.py:PASSTHROUGH_TAG.
-    Also covers the follow-up finding that PASSTHROUGH_TAG alone is not enough
-    for a 401: in client-key auth mode the *credential* forwarded upstream is
-    the operator's own ANTHROPIC_API_KEY rather than anything the client sent,
-    so CREDENTIAL_PASSTHROUGH_TAG is tagged separately and must NOT gate
-    400/404 (which are credential-independent, and were PR #809's original
-    noise-reduction target for client-key deployments).
+    400/404 from Anthropic must only be treated as "expected" (dropped from
+    Sentry) when the request that reached Anthropic is provably what the client
+    sent — see observability/sentry.py:PASSTHROUGH_TAG. PASSTHROUGH_TAG alone is
+    not enough for a 401: in client-key auth mode the *credential* forwarded
+    upstream is the operator's own ANTHROPIC_API_KEY rather than anything the
+    client sent, so CREDENTIAL_PASSTHROUGH_TAG is tagged separately and must NOT
+    gate 400/404, which are credential-independent.
     """
 
     def _make_io(

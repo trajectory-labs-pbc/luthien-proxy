@@ -57,25 +57,25 @@ _LLM_CONTENT_VARS = {
 
 # 408/429/500/502/503/504/529: provider throttling or brief unavailability.
 # Structurally impossible for the proxy to have provoked — dropped
-# unconditionally (56 unhandled 429 events in three days before this filter
-# existed).
+# unconditionally.
 _PROVIDER_SIDE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
 
-# 400/404: the client sent content Anthropic legitimately rejected —
-# malformed message content or an unknown model name (LUTHIEN-6: 1,080
-# events for one recurring 400; LUTHIEN-2: unknown-model 404s). This is a
-# property of the request body alone, independent of which credential
-# reached Anthropic. But the proxy is not always a transparent passthrough:
-# policy hooks can mutate or replace the request before it reaches
-# Anthropic, and operator-configured UPSTREAM_HEADERS or policy-context
-# injection can alter it too. Only drop these when the request carries
-# provenance (the PASSTHROUGH_TAG scope tag, set at the actual upstream
-# call boundary in _AnthropicPolicyIO) proving nothing touched it after the
-# client sent it.
+# 400/404: Anthropic rejected the request's content — malformed message
+# content or an unknown model name. This is a property of the request body
+# alone, independent of which credential reached Anthropic. But the proxy is
+# not always a transparent passthrough: policy hooks can mutate or replace
+# the request before it reaches Anthropic, and operator-configured
+# UPSTREAM_HEADERS or policy-context injection can alter it too. Only drop
+# these when the request carries provenance (the PASSTHROUGH_TAG scope tag,
+# set at the actual upstream call boundary in _AnthropicPolicyIO) proving
+# nothing touched it after the client sent it. The tag proves the proxy did
+# not change the request on the way out; it does not prove the content
+# started with the client, since a client may send back fields it received
+# in an earlier gateway response.
 _CONTENT_DEPENDENT_STATUS_CODES = frozenset({400, 404})
 
-# 401: an invalid bearer token passed through client-credential mode
-# (LUTHIEN-D). Unlike 400/404, this is NOT solely a body/header property: in
+# 401: an invalid bearer token passed through client-credential mode.
+# Unlike 400/404, this is NOT solely a body/header property: in
 # client-key auth mode the *credential* forwarded upstream is the operator's
 # own ANTHROPIC_API_KEY rather than anything the client sent, so an
 # unmodified body proves nothing about whose credential caused the 401 in
