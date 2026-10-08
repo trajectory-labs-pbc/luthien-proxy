@@ -99,7 +99,7 @@ CONFIG_FIELDS: tuple[ConfigFieldMeta, ...] = (
     ),
     ConfigFieldMeta(
         "localhost_auth_bypass", "LOCALHOST_AUTH_BYPASS", bool, True,
-        "Skip admin-route authentication for requests from localhost (proxy /v1/messages auth is unaffected; disable behind a same-host reverse proxy)",
+        "Skip admin-route authentication for direct loopback requests; requests carrying reverse-proxy forwarding headers (X-Forwarded-For etc.) never bypass (proxy /v1/messages auth is unaffected; disable behind a same-host reverse proxy)",
         category="auth", db_settable=True, restart_required=False,
     ),
 
@@ -145,6 +145,11 @@ CONFIG_FIELDS: tuple[ConfigFieldMeta, ...] = (
         "policy_cache_max_entries", "POLICY_CACHE_MAX_ENTRIES", int, 10_000,
         "Max rows per policy namespace in PolicyCache (0 or negative disables the cap)",
         category="policy",
+    ),
+    ConfigFieldMeta(
+        "passthrough_fallback_enabled", "PASSTHROUGH_FALLBACK_ENABLED", bool, False,
+        "When a policy-modified request fails upstream with a request-shaped 4xx (400/404/413/422), retry once with the original unmodified request. Fires only if the active policy opts in (passthrough_fallback_safe; default off, so redaction and other request-side safety edits are never undone) and actually changed the request; streaming falls back only before any backend event arrived. Emits a pipeline.passthrough_fallback event and records the resent original as the final request. Off by default (fail-open when on)",
+        category="policy", db_settable=True, restart_required=False,
     ),
 
     # ── database ──────────────────────────────────────────────────────────
